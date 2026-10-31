@@ -1639,6 +1639,78 @@ mod tests {
         (StyleRemap::init().unwrap(), HyperlinkRemap::init().unwrap())
     }
 
+
+    /// The fixed-width narrow codec must agree with the per-cell
+    /// `truncate` / `extend` rules for every row length, including empty
+    /// and short rows, and it must not write past the row.
+    #[test]
+    fn narrow_codec_matches_per_cell_truncate_and_extend() {
+        let patterns = [
+            0u64,
+            0x41 << cell_bits::CONTENT,
+            0xFF << cell_bits::CONTENT,
+            0x100 << cell_bits::CONTENT,
+            0xD7FF << cell_bits::CONTENT,
+            0xD800 << cell_bits::CONTENT,
+            0xDFFF << cell_bits::CONTENT,
+            0xE000 << cell_bits::CONTENT,
+            0xFFFF << cell_bits::CONTENT,
+            0x1F_FFFF << cell_bits::CONTENT,
+            u64::MAX,
+            0x3,
+            (0xBEEFu64 << cell_bits::STYLE_ID) | (0x41 << cell_bits::CONTENT),
+        ];
+        for width in [EncodedWidth::One, EncodedWidth::Two, EncodedWidth::Four] {
+            for count in [0usize, 1, 3, 4, 5, 7, 8, 17] {
+                let words: Vec<u64> = (0..count)
+                    .map(|i| patterns[i % patterns.len()].wrapping_mul(i as u64 + 1))
+                    .collect();
+                let size = width.size();
+                let mut fast = vec![0u8; count * size + 8];
+                encode_narrow_into(width, &words, count, &mut fast);
+                assert_eq!(&fast[count * size..], &[0u8; 8], "{width:?} count={count} wrote past the row");
+
+                let mut slow = vec![0u8; count * size];
+                for (j, &word) in words.iter().enumerate() {
+                    width.write_value(&mut slow[j * size..], width.truncate(word));
+                }
+                assert_eq!(&fast[..count * size], slow.as_slice(), "{width:?} count={count}");
+
+                if native_matches_wire() && matches!(width, EncodedWidth::One | EncodedWidth::Two) {
+                    let mut cells = vec![TerminalCell::init(0); count];
+                    widen_cells(width, &fast[..count * size], &mut cells);
+                    for (j, cell) in cells.iter().enumerate() {
+                        let value = width.read_value(&slow[j * size..]);
+                        let value = if width != EncodedWidth::One && !valid_scalar(value as u32) {
+                            0xFFFD
+                        } else {
+                            value
+                        };
+                        assert_eq!(
+                            cell.to_bits(),
+                            width.extend(value),
+                            "{width:?} count={count} cell={j}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // The streaming fallback truncates through `classify_word`, which is
+        // the identity when the native cell matches the wire word.
+        let cells: Vec<TerminalCell> = (0..17u32).map(TerminalCell::init).collect();
+        for width in [EncodedWidth::One, EncodedWidth::Two, EncodedWidth::Four] {
+            let mut got = Vec::new();
+            encode_narrow_cells(width, &cells, &mut got).unwrap();
+            let size = width.size();
+            let mut expect = vec![0u8; cells.len() * size];
+            for (j, cell) in cells.iter().enumerate() {
+                width.write_value(&mut expect[j * size..], width.truncate(classify_word(cell)));
+            }
+            assert_eq!(got, expect, "{width:?}");
+        }
+    }
+
     #[test]
     fn cell_wire_layout_registry() {
         // The wire bit positions are format constants. The shifts and masks
