@@ -162,7 +162,8 @@ pub fn compress(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Resul
             // Hash the next four bytes and replace the table entry
             // immediately. Hash collisions are expected, so equality is
             // checked below before accepting a saved position as a match.
-            let sequence = read_u32(input, ip);
+            // SAFETY: ip <= search_end, so ip + 4 <= input.len().
+            let sequence = unsafe { read_u32_unchecked(input, ip) };
             let hash = hash_sequence(sequence);
             let candidates = table[hash];
             remember_position(table, hash, ip);
@@ -177,13 +178,20 @@ pub fn compress(input: &[u8], output: &mut [u8], table: &mut HashTable) -> Resul
                 }
             };
 
-            if read_u32(input, match_pos) != sequence {
+            // SAFETY: candidates precede ip (see candidate_position).
+            if unsafe { read_u32_unchecked(input, match_pos) } != sequence {
                 // The nearest candidate collided. Fall back to the older
                 // one, which must additionally match one byte beyond the
                 // minimum so collision-prone minimum-length matches from
                 // the stale half are not emitted.
                 let older = candidate_position(ip, (candidates >> 16) as u16).filter(|&older| {
-                    read_u32(input, older) == sequence && input[older + MIN_MATCH] == input[ip + MIN_MATCH]
+                    // SAFETY: older < ip <= search_end, so both reads end
+                    // at least MATCH_FIND_LIMIT - MIN_MATCH - 1 bytes
+                    // before the end of the input.
+                    unsafe {
+                        read_u32_unchecked(input, older) == sequence
+                            && *input.get_unchecked(older + MIN_MATCH) == *input.get_unchecked(ip + MIN_MATCH)
+                    }
                 });
                 match older {
                     Some(older) => match_pos = older,
@@ -488,6 +496,19 @@ fn read_u16(input: &[u8], position: usize) -> u16 {
 #[inline(always)]
 fn read_u32(input: &[u8], position: usize) -> u32 {
     u32::from_le_bytes(input[position..position + 4].try_into().unwrap())
+}
+
+/// `read_u32` without the bounds check, for the per-byte match search
+/// whose positions the loop bounds already prove in range.
+///
+/// # Safety
+///
+/// `position + 4 <= input.len()`.
+#[inline(always)]
+unsafe fn read_u32_unchecked(input: &[u8], position: usize) -> u32 {
+    debug_assert!(position + 4 <= input.len());
+    // SAFETY: in bounds per the caller; unaligned reads are allowed.
+    unsafe { input.as_ptr().add(position).cast::<u32>().read_unaligned() }.to_le()
 }
 
 #[inline(always)]
