@@ -444,17 +444,28 @@ impl EncodedWidth {
     /// Write one transported value little-endian into `out`.
     #[inline(always)]
     fn write_value(self, out: &mut [u8], value: u64) {
-        let size = self.size();
-        out[..size].copy_from_slice(&value.to_le_bytes()[..size]);
+        // One fixed-size store per width (Zig: `std.mem.writeInt` with a
+        // comptime integer type). A runtime-length copy would become a
+        // libc `memcpy` call per cell.
+        let bytes = value.to_le_bytes();
+        match self {
+            EncodedWidth::One => out[0] = bytes[0],
+            EncodedWidth::Two => out[..2].copy_from_slice(&bytes[..2]),
+            EncodedWidth::Four => out[..4].copy_from_slice(&bytes[..4]),
+            EncodedWidth::Eight => out[..8].copy_from_slice(&bytes),
+        }
     }
 
     /// Read one transported value little-endian from `bytes`.
     #[inline(always)]
     fn read_value(self, bytes: &[u8]) -> u64 {
-        let size = self.size();
-        let mut buf = [0u8; 8];
-        buf[..size].copy_from_slice(&bytes[..size]);
-        u64::from_le_bytes(buf)
+        // One fixed-size load per width, see `write_value`.
+        match self {
+            EncodedWidth::One => bytes[0] as u64,
+            EncodedWidth::Two => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
+            EncodedWidth::Four => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64,
+            EncodedWidth::Eight => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+        }
     }
 }
 
@@ -777,13 +788,25 @@ fn classify_word(cell: &TerminalCell) -> u64 {
 /// Every admitted cell round-trips exactly because the row's width
 /// selection proved every cell word survives `truncate` then `extend`.
 fn encode_narrow_cells(width: EncodedWidth, cells: &[TerminalCell], writer: &mut dyn io::Writer) -> io::Result<()> {
+    match width {
+        EncodedWidth::One => encode_narrow_cells_w::<0>(cells, writer),
+        EncodedWidth::Two => encode_narrow_cells_w::<1>(cells, writer),
+        EncodedWidth::Four => encode_narrow_cells_w::<2>(cells, writer),
+        EncodedWidth::Eight => unreachable!(),
+    }
+}
+
+/// `encode_narrow_cells` for one width, given as `EncodedWidth as u8`
+/// (Zig: `comptime width`), so every store has a fixed size.
+fn encode_narrow_cells_w<const W: u8>(cells: &[TerminalCell], writer: &mut dyn io::Writer) -> io::Result<()> {
+    let width = EncodedWidth::from_int(W);
     let size = width.size();
     let mut chunk = [0u8; 1024];
     let mut i = 0;
     while i < cells.len() {
         let n = (cells.len() - i).min(chunk.len() / size);
-        for (j, cell) in cells[i..i + n].iter().enumerate() {
-            width.write_value(&mut chunk[j * size..], width.truncate(classify_word(cell)));
+        for (out, cell) in chunk[..n * size].chunks_exact_mut(size).zip(&cells[i..i + n]) {
+            width.write_value(out, width.truncate(classify_word(cell)));
         }
         writer.write_all(&chunk[..n * size])?;
         i += n;
@@ -794,9 +817,22 @@ fn encode_narrow_cells(width: EncodedWidth, cells: &[TerminalCell], writer: &mut
 /// Truncate one row's cell words into `out` at the given encoded width.
 fn encode_narrow_into(width: EncodedWidth, words: &[u64], count: usize, out: &mut [u8]) {
     debug_assert!(bulk_codec());
+    match width {
+        EncodedWidth::One => encode_narrow_into_w::<0>(words, count, out),
+        EncodedWidth::Two => encode_narrow_into_w::<1>(words, count, out),
+        EncodedWidth::Four => encode_narrow_into_w::<2>(words, count, out),
+        EncodedWidth::Eight => unreachable!(),
+    }
+}
+
+/// `encode_narrow_into` for one width, given as `EncodedWidth as u8`
+/// (Zig: `comptime width`), so every store has a fixed size.
+#[inline(always)]
+fn encode_narrow_into_w<const W: u8>(words: &[u64], count: usize, out: &mut [u8]) {
+    let width = EncodedWidth::from_int(W);
     let size = width.size();
-    for (j, &word) in words[..count].iter().enumerate() {
-        width.write_value(&mut out[j * size..], width.truncate(word));
+    for (out, &word) in out[..count * size].chunks_exact_mut(size).zip(&words[..count]) {
+        width.write_value(out, width.truncate(word));
     }
 }
 
@@ -1054,19 +1090,33 @@ fn decode_narrow_cells(width: EncodedWidth, reader: &mut dyn io::Reader, cells: 
 
 /// Store codepoint-valued encoded cells of the given width.
 fn widen_cells(width: EncodedWidth, bytes: &[u8], cells: &mut [TerminalCell]) {
+    match width {
+        EncodedWidth::One => widen_cells_w::<0>(bytes, cells),
+        EncodedWidth::Two => widen_cells_w::<1>(bytes, cells),
+        EncodedWidth::Four => widen_cells_w::<2>(bytes, cells),
+        EncodedWidth::Eight => widen_cells_w::<3>(bytes, cells),
+    }
+}
+
+/// `widen_cells` for one width, given as `EncodedWidth as u8` (Zig:
+/// `comptime width`), so every load has a fixed size.
+#[inline(always)]
+fn widen_cells_w<const W: u8>(bytes: &[u8], cells: &mut [TerminalCell]) {
+    let width = EncodedWidth::from_int(W);
     let size = width.size();
+    let bytes = &bytes[..cells.len() * size];
 
     // When the native cell matches the wire word, this is a pure widening
     // loop over integers.
     if native_matches_wire() {
-        for (i, cell) in cells.iter_mut().enumerate() {
-            *cell = TerminalCell::from_bits(width.extend(widen_value(width, &bytes[i * size..])));
+        for (cell, value) in cells.iter_mut().zip(bytes.chunks_exact(size)) {
+            *cell = TerminalCell::from_bits(width.extend(widen_value(width, value)));
         }
         return;
     }
 
-    for (i, cell) in cells.iter_mut().enumerate() {
-        store_cell(cell, width.extend(widen_value(width, &bytes[i * size..])));
+    for (cell, value) in cells.iter_mut().zip(bytes.chunks_exact(size)) {
+        store_cell(cell, width.extend(widen_value(width, value)));
     }
 }
 
@@ -1105,8 +1155,9 @@ fn decode_word_cells(
     // The staged payload path has the complete row buffered.
     let total = count * size;
     if reader.buffered_len() >= total {
+        let buffered = &reader.buffered()[..total];
         for x in 0..count {
-            let bits = width.extend(width.read_value(&reader.buffered()[x * size..]));
+            let bits = width.extend(width.read_value(&buffered[x * size..]));
             row_or |= bits;
             apply_cell(page, row, cells, x, bits, style_remap, hyperlink_remap);
         }

@@ -593,6 +593,10 @@ impl Capture {
     /// beyond max_bytes. The allocating writer normally grows
     /// super-linearly, so grow it explicitly to keep the allocation itself
     /// bounded too.
+    ///
+    /// This runs for every byte of a captured OSC, so the common case (room
+    /// left in the buffer) is inline and the rest is out of line.
+    #[inline]
     pub fn write_byte(&mut self, byte: u8) -> Result<(), WriteFailed> {
         if self.data.len() >= self.max_bytes {
             return Err(WriteFailed);
@@ -602,15 +606,22 @@ impl Capture {
             Backing::Fixed => {}
             Backing::Allocating => {
                 if self.data.len() >= self.buffer_len {
-                    let new_capacity = self
-                        .max_bytes
-                        .min(self.buffer_len.saturating_mul(2).max(1));
-                    self.grow(new_capacity)?;
+                    self.grow_for_byte()?;
                 }
             }
         }
 
         self.writer_write_byte(byte)
+    }
+
+    /// The growth step of `write_byte` for a full allocating buffer.
+    #[cold]
+    #[inline(never)]
+    fn grow_for_byte(&mut self) -> Result<(), WriteFailed> {
+        let new_capacity = self
+            .max_bytes
+            .min(self.buffer_len.saturating_mul(2).max(1));
+        self.grow(new_capacity)
     }
 
     /// Append a slice without permitting the backing allocation to
@@ -648,19 +659,27 @@ impl Capture {
     /// Write a byte directly to the underlying writer (Zig:
     /// `cap.writer.writeByte`). A fixed buffer fails when full; an
     /// allocating buffer grows without regard to `max_bytes`.
+    #[inline]
     pub fn writer_write_byte(&mut self, byte: u8) -> Result<(), WriteFailed> {
         if self.data.len() >= self.buffer_len {
-            match self.backing {
-                Backing::Fixed => return Err(WriteFailed),
-                Backing::Allocating => {
-                    let new_capacity = (self.buffer_len + self.buffer_len / 2 + 8)
-                        .max(self.data.len() + 1);
-                    self.grow(new_capacity)?;
-                }
-            }
+            self.writer_make_room()?;
         }
         self.data.push(byte);
         Ok(())
+    }
+
+    /// The full-buffer case of `writer_write_byte`.
+    #[cold]
+    #[inline(never)]
+    fn writer_make_room(&mut self) -> Result<(), WriteFailed> {
+        match self.backing {
+            Backing::Fixed => Err(WriteFailed),
+            Backing::Allocating => {
+                let new_capacity = (self.buffer_len + self.buffer_len / 2 + 8)
+                    .max(self.data.len() + 1);
+                self.grow(new_capacity)
+            }
+        }
     }
 
     /// Return the captured trailing data. This is the data from the
@@ -1123,7 +1142,8 @@ impl Parser {
     /// Handle a failed capture write, either from reaching the capture's
     /// limit or from an allocation failure. Supported OSCs become invalid.
     /// Unknown OSCs keep what was captured and are reported as truncated.
-    #[inline]
+    #[cold]
+    #[inline(never)]
     fn capture_failed(&mut self) {
         match self.state {
             State::Unknown => {
@@ -1178,6 +1198,12 @@ impl Parser {
     }
 
     /// Consume the next character c and advance the parser state.
+    ///
+    /// Inline so that the per-byte capture path costs no call (the Zig
+    /// benchmark calls `next` with `.always_inline`). The prefix state
+    /// machine, which only runs for the first few bytes of a sequence, is
+    /// `next_prefix`.
+    #[inline]
     pub fn next(&mut self, c: u8) {
         // If the state becomes invalid for any reason, just discard
         // any further input.
@@ -1196,6 +1222,12 @@ impl Parser {
             return;
         }
 
+        self.next_prefix(c);
+    }
+
+    /// The state machine part of `next`: the command prefix before a
+    /// capture starts.
+    fn next_prefix(&mut self, c: u8) {
         use State as S;
         match self.state {
             // handled above, so should never be here

@@ -69,6 +69,16 @@ pub enum Format {
 }
 
 /// Returns true if the format emits styled output (not plaintext).
+/// The `Format` with the given discriminant, for code specialized on the
+/// format through a const generic (Zig: `comptime emit: Format`).
+const fn format_from_const(emit: u8) -> Format {
+    match emit {
+        0 => Format::Plain,
+        1 => Format::Vt,
+        _ => Format::Html,
+    }
+}
+
 pub fn format_styled(fmt: Format) -> bool {
     match fmt {
         Format::Plain => false,
@@ -1265,8 +1275,11 @@ impl<'a> PageFormatter<'a> {
     pub fn format_with_state(&mut self, writer: &mut dyn Write) -> io::Result<TrailingState> {
         // Specialize the hot path on the emitted format so that the
         // per-cell loop contains no per-cell format dispatch.
-        let emit = self.opts.emit;
-        self.format_with_state_emit(writer, emit)
+        match self.opts.emit {
+            Format::Plain => self.format_with_state_emit::<{ Format::Plain as u8 }>(writer),
+            Format::Vt => self.format_with_state_emit::<{ Format::Vt as u8 }>(writer),
+            Format::Html => self.format_with_state_emit::<{ Format::Html as u8 }>(writer),
+        }
     }
 
     fn cells_of(&self, row: &Row) -> &'a [Cell] {
@@ -1274,7 +1287,8 @@ impl<'a> PageFormatter<'a> {
         unsafe { &*self.page.get_cells(row) }
     }
 
-    fn format_with_state_emit(&mut self, writer: &mut dyn Write, emit: Format) -> io::Result<TrailingState> {
+    fn format_with_state_emit<const EMIT: u8>(&mut self, writer: &mut dyn Write) -> io::Result<TrailingState> {
+        let emit = format_from_const(EMIT);
         let mut blank_rows: usize = 0;
         let mut blank_cells: usize = 0;
 
@@ -1540,9 +1554,13 @@ impl<'a> PageFormatter<'a> {
                     // loop that never checks for them.
                     let hyperlinks = format_styled(emit) && page_hyperlinks;
                     let track_points = self.point_map.is_some();
-                    let consumed = self.write_cell_run(
-                        emit,
-                        hyperlinks,
+                    let run = if hyperlinks {
+                        Self::write_cell_run::<EMIT, true>
+                    } else {
+                        Self::write_cell_run::<EMIT, false>
+                    };
+                    let consumed = run(
+                        self,
                         track_points,
                         writer,
                         &cells_subset[cell_i..],
@@ -1879,11 +1897,13 @@ impl<'a> PageFormatter<'a> {
     /// Blank cell accounting matches the slow path: accumulated blanks
     /// are only materialized once a non-blank cell is found, and any
     /// remainder is written back to `blank_cells`.
+    // Deliberately not inlined: this is instantiated per emit format and
+    // hyperlink mode (Zig: `comptime emit`, `comptime hyperlinks`), and
+    // inlining every copy into the row loop bloats the binary.
     #[allow(clippy::too_many_arguments)]
-    fn write_cell_run(
+    #[inline(never)]
+    fn write_cell_run<const EMIT: u8, const HYPERLINKS: bool>(
         &mut self,
-        emit: Format,
-        hyperlinks: bool,
         track_points: bool,
         writer: &mut dyn Write,
         cells: &[Cell],
@@ -1894,6 +1914,8 @@ impl<'a> PageFormatter<'a> {
         blank_cells: &mut usize,
     ) -> io::Result<usize> {
         debug_assert!(track_points == self.point_map.is_some());
+        let emit = format_from_const(EMIT);
+        let hyperlinks = HYPERLINKS;
 
         let mut buf = [0u8; 512];
         let mut len: usize = 0;
@@ -2314,7 +2336,7 @@ impl<'a> PageFormatter<'a> {
 /// Encode a single codepoint into buf at len, advancing len and
 /// returning the number of bytes written. The caller must guarantee
 /// enough remaining buffer space for the largest possible encoding.
-#[inline]
+#[inline(always)]
 fn encode_codepoint(emit: Format, buf: &mut [u8; 512], len: &mut usize, cp: u32) -> usize {
     let start = *len;
     match emit {

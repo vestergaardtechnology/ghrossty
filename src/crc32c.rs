@@ -10,6 +10,12 @@
 //! extension) and x86_64 (SSE4.2). This module selects the best backend at
 //! compile time.
 //!
+//! Deviation: an x86_64 build without SSE4.2 enabled at compile time (the
+//! default `x86-64` baseline) also checks for SSE4.2 at runtime and uses
+//! the CRC32C instruction when the CPU has it. Zig builds for the native
+//! CPU by default, so its default build gets the instruction at compile
+//! time. The result is identical either way.
+//!
 //! Targets without a dedicated instruction, such as WebAssembly, use a
 //! custom implementation that is faster than a byte-at-a-time table.
 //!
@@ -77,13 +83,52 @@ fn update_backend(crc: u32, bytes: &[u8]) -> u32 {
     update_hardware(crc, bytes)
 }
 
+#[cfg(all(target_arch = "x86_64", not(target_feature = "sse4.2")))]
+#[inline(always)]
+fn update_backend(crc: u32, bytes: &[u8]) -> u32 {
+    if std::arch::is_x86_feature_detected!("sse4.2") {
+        // SAFETY: the CPU supports SSE4.2 (checked above).
+        return unsafe { runtime_sse42::update(crc, bytes) };
+    }
+    software::update(crc, bytes)
+}
+
 #[cfg(not(any(
     all(target_arch = "aarch64", target_feature = "crc"),
-    all(target_arch = "x86_64", target_feature = "sse4.2")
+    target_arch = "x86_64"
 )))]
 #[inline(always)]
 fn update_backend(crc: u32, bytes: &[u8]) -> u32 {
     software::update(crc, bytes)
+}
+
+/// `update_hardware` for x86_64 builds without SSE4.2 at compile time,
+/// for CPUs that have it at runtime.
+#[cfg(all(target_arch = "x86_64", not(target_feature = "sse4.2")))]
+mod runtime_sse42 {
+    use std::arch::x86_64::{_mm_crc32_u32, _mm_crc32_u64, _mm_crc32_u8};
+
+    /// # Safety
+    ///
+    /// The CPU must support SSE4.2.
+    #[target_feature(enable = "sse4.2")]
+    pub unsafe fn update(initial: u32, bytes: &[u8]) -> u32 {
+        let mut crc = initial;
+        let mut remaining = bytes;
+
+        while remaining.len() >= 8 {
+            crc = _mm_crc32_u64(crc as u64, u64::from_le_bytes(remaining[0..8].try_into().unwrap())) as u32;
+            remaining = &remaining[8..];
+        }
+        if remaining.len() >= 4 {
+            crc = _mm_crc32_u32(crc, u32::from_le_bytes(remaining[0..4].try_into().unwrap()));
+            remaining = &remaining[4..];
+        }
+        for &byte in remaining {
+            crc = _mm_crc32_u8(crc, byte);
+        }
+        crc
+    }
 }
 
 /// One update pass using the dedicated CRC32C instructions. Both supported
