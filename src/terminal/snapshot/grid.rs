@@ -1639,7 +1639,6 @@ mod tests {
         (StyleRemap::init().unwrap(), HyperlinkRemap::init().unwrap())
     }
 
-
     /// The fixed-width narrow codec must agree with the per-cell
     /// `truncate` / `extend` rules for every row length, including empty
     /// and short rows, and it must not write past the row.
