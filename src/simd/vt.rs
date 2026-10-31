@@ -7,8 +7,13 @@
 //! that fuses the ESC scan with the UTF-8 -> UTF-32 widening 16 bytes at a
 //! time (SSE2 on x86_64, SWAR elsewhere), falling back on the first non-ASCII
 //! byte to a `memchr` ESC search plus the scalar maximal-subpart decoder.
+//! Where simdutf converts multi-byte UTF-8 with AVX2, the port does the
+//! same on x86_64 CPUs with AVX2 (detected at runtime): blocks of 16
+//! sequence starts that are entirely valid UTF-8 are validated and
+//! converted with vector code, and anything else (ill-formed input,
+//! incomplete sequences, the last 32 bytes) takes the scalar decoder.
 //! Results are identical to `utf8_decode_until_control_seq_scalar` (checked
-//! by the differential test, as in Zig).
+//! by the differential tests, as in Zig).
 
 use super::index_of::index_of;
 
@@ -164,7 +169,7 @@ fn swar_stop_mask(w: u64) -> u64 {
 fn decode_non_ascii_until_control_seq(input: &[u8], base: usize, output: &mut [u32]) -> DecodeResult {
     let rest = &input[base..];
     let idx = index_of(rest, 0x1B).unwrap_or(rest.len());
-    let r = decode_region(&rest[..idx], idx == rest.len(), &mut output[base..]);
+    let r = decode_region(&rest[..idx], idx == rest.len(), &mut output[base..], avx2::available());
     DecodeResult {
         consumed: base + r.consumed,
         decoded: base + r.decoded,
@@ -176,19 +181,45 @@ fn utf8_decode_until_control_seq_scalar(input: &[u8], output: &mut [u32]) -> Dec
     // Find our escape
     let idx = index_of(input, 0x1B).unwrap_or(input.len());
     let decode = &input[..idx];
-    decode_region(decode, decode.len() == input.len(), output)
+    decode_region(decode, decode.len() == input.len(), output, false)
 }
 
 /// The decode loop of the Zig `utf8DecodeUntilControlSeqScalar`.
 /// `at_input_end` is true when `decode` ends at the true end of the input
 /// (`decode.len == input.len` in Zig), i.e. it was not bounded by an ESC.
-fn decode_region(decode: &[u8], at_input_end: bool, output: &mut [u32]) -> DecodeResult {
+/// `simd` enables the AVX2 block decoder, which the caller must have
+/// checked with `avx2::available`.
+fn decode_region(decode: &[u8], at_input_end: bool, output: &mut [u32], simd: bool) -> DecodeResult {
+    debug_assert!(output.len() >= decode.len());
+
     // Go through and decode one item at a time, following the W3C/Unicode
     // "U+FFFD Substitution of Maximal Subparts" algorithm for ill-formed
     // subsequences.
     let mut decode_offset: usize = 0;
     let mut decode_count: usize = 0;
     while decode_offset < decode.len() {
+        // Vectorized blocks of valid UTF-8. A block the vector decoder
+        // rejects takes one scalar step below, which handles its first
+        // item exactly as if the vector decoder did not exist.
+        #[cfg(target_arch = "x86_64")]
+        if simd && decode.len() - decode_offset >= avx2::WINDOW && output.len() - decode_count >= avx2::MAX_OUT {
+            // SAFETY: AVX2 is available (the caller checked), WINDOW input
+            // bytes are readable and MAX_OUT output elements writable.
+            let r = unsafe {
+                avx2::decode_block(
+                    decode.as_ptr().add(decode_offset),
+                    output.as_mut_ptr().add(decode_count),
+                )
+            };
+            if let Some((consumed, decoded)) = r {
+                decode_offset += consumed;
+                decode_count += decoded;
+                continue;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = simd;
+
         let b0 = decode[decode_offset];
 
         // ASCII fast path.
@@ -297,6 +328,165 @@ fn decode_region(decode: &[u8], at_input_end: bool, output: &mut [u32]) -> Decod
     }
 }
 
+/// AVX2 conversion of valid multi-byte UTF-8 to UTF-32 (simdutf's role in
+/// the Zig build).
+///
+/// A block looks at `WINDOW` input bytes and takes the sequences that
+/// start in its first `STARTS` bytes. The block is accepted only when all
+/// of them are well-formed (every lead byte is followed by exactly the
+/// continuation bytes it needs, within the Table 3-7 ranges, and no other
+/// byte is a continuation or invalid). A well-formed sequence has exactly
+/// one decoding, so an accepted block produces what the scalar decoder
+/// would. Each of the 16 start positions is decoded as if it were a lead
+/// byte, then the real starts are left-packed into the output.
+#[cfg(target_arch = "x86_64")]
+mod avx2 {
+    use std::arch::x86_64::*;
+
+    /// Input bytes a block reads.
+    pub const WINDOW: usize = 32;
+    /// Positions a block decodes sequences from.
+    const STARTS: u32 = 16;
+    /// Output elements a block may write (decoded or scratch).
+    pub const MAX_OUT: usize = 16;
+
+    #[inline]
+    pub fn available() -> bool {
+        std::arch::is_x86_feature_detected!("avx2")
+    }
+
+    /// For each 8-bit mask, the indices of its set bits in order: the
+    /// `vpermd` permutation that left-packs those lanes.
+    static PACK: [[u32; 8]; 256] = {
+        let mut table = [[0u32; 8]; 256];
+        let mut mask = 0;
+        while mask < 256 {
+            let mut n = 0;
+            let mut lane = 0;
+            while lane < 8 {
+                if mask & (1 << lane) != 0 {
+                    table[mask][n] = lane as u32;
+                    n += 1;
+                }
+                lane += 1;
+            }
+            mask += 1;
+        }
+        table
+    };
+
+    /// Bytes `>= c` (unsigned) as a bitmask.
+    #[inline(always)]
+    unsafe fn ge(v: __m256i, c: u8) -> u32 {
+        let c = _mm256_set1_epi8(c as i8);
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_max_epu8(v, c), v)) as u32
+    }
+
+    /// Bytes `== c` as a bitmask.
+    #[inline(always)]
+    unsafe fn eq(v: __m256i, c: u8) -> u32 {
+        _mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(c as i8))) as u32
+    }
+
+    /// Validate and convert one block. Returns the bytes consumed (16 to
+    /// 19, always ending on a sequence boundary) and codepoints written, or
+    /// None (with `dst` possibly scribbled on) if the block is not
+    /// entirely well-formed.
+    ///
+    /// # Safety
+    ///
+    /// AVX2 must be available, `src` must have `WINDOW` readable bytes and
+    /// `dst` `MAX_OUT` writable elements.
+    #[target_feature(enable = "avx2")]
+    pub unsafe fn decode_block(src: *const u8, dst: *mut u32) -> Option<(usize, usize)> {
+        const W: u32 = (1 << STARTS) - 1;
+
+        // SAFETY: WINDOW bytes are readable.
+        let v = unsafe { _mm256_loadu_si256(src.cast()) };
+        let hi = _mm256_movemask_epi8(v) as u32;
+        if hi & W == 0 {
+            // Plain ASCII: the scalar loop's ASCII run handles it.
+            return None;
+        }
+        let ge_90 = ge(v, 0x90);
+        let ge_a0 = ge(v, 0xA0);
+        let ge_c0 = ge(v, 0xC0);
+        let ge_c2 = ge(v, 0xC2);
+        let ge_e0 = ge(v, 0xE0);
+        let ge_f0 = ge(v, 0xF0);
+        let ge_f5 = ge(v, 0xF5);
+
+        let ascii = !hi;
+        let cont = hi & !ge_c0;
+        let lead2 = ge_c2 & !ge_e0;
+        let lead3 = ge_e0 & !ge_f0;
+        let lead4 = ge_f0 & !ge_f5;
+        let invalid = (ge_c0 & !ge_c2) | ge_f5;
+
+        // The first continuation byte's lead-dependent range (Table 3-7).
+        let bad_second = (eq(v, 0xE0) & !(ge_a0 >> 1))
+            | (eq(v, 0xED) & (ge_a0 >> 1))
+            | (eq(v, 0xF0) & !(ge_90 >> 1))
+            | (eq(v, 0xF4) & (ge_90 >> 1));
+
+        let (lead2, lead3, lead4) = (lead2 & W, lead3 & W, lead4 & W);
+        let required = ((lead2 | lead3 | lead4) << 1) | ((lead3 | lead4) << 2) | (lead4 << 3);
+        if (invalid | bad_second) & W != 0 || cont & W != required & W || required & !cont != 0 {
+            return None;
+        }
+        let starts = (ascii | lead2 | lead3 | lead4) & W;
+        let consumed = STARTS + (required >> STARTS).count_ones();
+
+        // Decode the 16 positions as if each were a lead byte, 8 at a
+        // time: lane k holds the four bytes from position k.
+        let words = _mm256_setr_epi8(
+            0, 1, 2, 3, 1, 2, 3, 4, 2, 3, 4, 5, 3, 4, 5, 6, //
+            4, 5, 6, 7, 5, 6, 7, 8, 6, 7, 8, 9, 7, 8, 9, 10,
+        );
+        let low6 = _mm256_set1_epi32(0x3F);
+        let byte = _mm256_set1_epi32(0xFF);
+        let mut written = 0usize;
+        for group in 0..2 {
+            // SAFETY: bytes 8 * group .. 8 * group + 16 are in the window.
+            let chunk = unsafe { _mm_loadu_si128(src.add(8 * group).cast()) };
+            let w = _mm256_shuffle_epi8(_mm256_broadcastsi128_si256(chunk), words);
+            let b0 = _mm256_and_si256(w, byte);
+            let t1 = _mm256_and_si256(_mm256_srli_epi32(w, 8), low6);
+            let t2 = _mm256_and_si256(_mm256_srli_epi32(w, 16), low6);
+            let t3 = _mm256_and_si256(_mm256_srli_epi32(w, 24), low6);
+
+            let cp2 = _mm256_or_si256(_mm256_slli_epi32(_mm256_and_si256(b0, _mm256_set1_epi32(0x1F)), 6), t1);
+            let cp3 = _mm256_or_si256(
+                _mm256_slli_epi32(_mm256_and_si256(b0, _mm256_set1_epi32(0x0F)), 12),
+                _mm256_or_si256(_mm256_slli_epi32(t1, 6), t2),
+            );
+            let cp4 = _mm256_or_si256(
+                _mm256_or_si256(
+                    _mm256_slli_epi32(_mm256_and_si256(b0, _mm256_set1_epi32(0x07)), 18),
+                    _mm256_slli_epi32(t1, 12),
+                ),
+                _mm256_or_si256(_mm256_slli_epi32(t2, 6), t3),
+            );
+
+            let is_ascii = _mm256_cmpgt_epi32(_mm256_set1_epi32(0x80), b0);
+            let is_2 = _mm256_cmpgt_epi32(_mm256_set1_epi32(0xE0), b0);
+            let is_3 = _mm256_cmpgt_epi32(_mm256_set1_epi32(0xF0), b0);
+            let cp = _mm256_blendv_epi8(cp4, cp3, is_3);
+            let cp = _mm256_blendv_epi8(cp, cp2, is_2);
+            let cp = _mm256_blendv_epi8(cp, b0, is_ascii);
+
+            let mask = (starts >> (8 * group)) & 0xFF;
+            // SAFETY: PACK rows are 8 u32s.
+            let perm = unsafe { _mm256_loadu_si256(PACK[mask as usize].as_ptr().cast()) };
+            let packed = _mm256_permutevar8x32_epi32(cp, perm);
+            // SAFETY: written <= 8, so 8 lanes fit in MAX_OUT.
+            unsafe { _mm256_storeu_si256(dst.add(written).cast(), packed) };
+            written += mask.count_ones() as usize;
+        }
+        Some((consumed as usize, written))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,6 +561,87 @@ mod tests {
                 &input[..len]
             );
         }
+    }
+
+    /// A random codepoint whose UTF-8 encoding has `len` bytes.
+    fn random_char(rand: &mut Rng, len: u64) -> char {
+        loop {
+            let cp = match len {
+                1 => rand.range(0x20, 0x7E),
+                2 => rand.range(0x80, 0x7FF),
+                3 => rand.range(0x800, 0xFFFF),
+                _ => rand.range(0x10000, 0x10FFFF),
+            };
+            if let Some(c) = char::from_u32(cp as u32) {
+                return c;
+            }
+        }
+    }
+
+    // Differential test for the vectorized multi-byte decoder: mostly
+    // valid mixed-length UTF-8 (so whole blocks take the vector path),
+    // with occasional corruption, controls and escapes at random places.
+    #[test]
+    fn decode_multibyte_matches_scalar() {
+        let mut rand = Rng(0x5eed_cafe);
+        let mut out_simd = [0u32; 600];
+        let mut out_scalar = [0u32; 600];
+
+        for iter in 0..20_000 {
+            let mut input: Vec<u8> = Vec::new();
+            let chars = rand.range(0, 120);
+            let max_len = rand.range(1, 4);
+            for _ in 0..chars {
+                let len = rand.range(1, max_len);
+                let c = random_char(&mut rand, len);
+                let mut buf = [0u8; 4];
+                input.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            // Corrupt some inputs: replace bytes or truncate.
+            if iter % 3 != 0 {
+                for _ in 0..rand.range(1, 3) {
+                    if input.is_empty() {
+                        break;
+                    }
+                    let at = rand.range(0, input.len() as u64 - 1) as usize;
+                    match rand.range(0, 4) {
+                        0 => input[at] = rand.byte(),
+                        1 => input[at] = 0x1B,
+                        2 => input[at] = rand.range(0x80, 0xBF) as u8,
+                        3 => input[at] = [0xE0, 0xED, 0xF0, 0xF4, 0xC0, 0xC1, 0xF5][rand.range(0, 6) as usize],
+                        _ => input.truncate(at),
+                    }
+                }
+            }
+            let len = input.len().min(out_simd.len());
+
+            let res_simd = utf8_decode_until_control_seq(&input[..len], &mut out_simd);
+            let res_scalar = utf8_decode_until_control_seq_scalar(&input[..len], &mut out_scalar);
+            assert_eq!(res_scalar.consumed, res_simd.consumed, "input={:x?}", &input[..len]);
+            assert_eq!(res_scalar.decoded, res_simd.decoded, "input={:x?}", &input[..len]);
+            assert_eq!(
+                &out_scalar[..res_scalar.decoded],
+                &out_simd[..res_simd.decoded],
+                "input={:x?}",
+                &input[..len]
+            );
+        }
+    }
+
+    // The vector decoder takes valid multi-byte blocks where AVX2 exists.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn decode_block_accepts_valid_utf8() {
+        if !avx2::available() {
+            return;
+        }
+        let s = "ünïcödé ✓ 日本語 🎉 ünïcödé ✓ 日本語 🎉 ünïcödé";
+        let mut out = [0u32; avx2::MAX_OUT];
+        // SAFETY: AVX2 is available, s is longer than WINDOW, out is MAX_OUT.
+        let r = unsafe { avx2::decode_block(s.as_ptr(), out.as_mut_ptr()) };
+        let (consumed, decoded) = r.expect("valid UTF-8 block is accepted");
+        let expected: Vec<u32> = s[..consumed].chars().map(|c| c as u32).collect();
+        assert_eq!(&expected[..], &out[..decoded]);
     }
 
     #[test]
