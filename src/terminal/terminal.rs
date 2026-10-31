@@ -599,6 +599,13 @@ const fn print_slice_cells_per_cp(wide: bool) -> usize {
     }
 }
 
+/// Whether a codepoint is in [0x10, 0xFF]: always narrow and always
+/// eligible for the batched narrow print fast path.
+#[inline(always)]
+fn print_slice_narrow_byte(cp: u32) -> bool {
+    cp.wrapping_sub(0x10) <= 0xFF - 0x10
+}
+
 /// Whether a codepoint above 0xFF is eligible for the batched print
 /// fast path with the given width class.
 #[inline(always)]
@@ -645,21 +652,22 @@ fn print_slice_store_run(
     // corrupt the stored codepoints.
     debug_assert!(template_bits & cell_fields::CONTENT.mask() == 0);
 
+    // One bounds check up front instead of one per cell, so the store
+    // loop below is branch-free (and vectorizable).
+    let cps = &cps[from..to];
+    // SAFETY: cells from..to are within the cursor row, and nothing else
+    // references them while this runs.
+    let dst = unsafe { std::slice::from_raw_parts_mut(cells.add(from), to - from) };
+
     if let Some(table) = charset_table {
-        for idx in from..to {
-            // SAFETY: idx < cell_count, within the cursor row.
-            unsafe {
-                *cells.add(idx) = Cell::from_bits(template_bits | ((table[cps[idx] as usize] as u64) << CP_SHIFT));
-            }
+        for (cell, &cp) in dst.iter_mut().zip(cps) {
+            *cell = Cell::from_bits(template_bits | ((table[cp as usize] as u64) << CP_SHIFT));
         }
         return;
     }
 
-    for idx in from..to {
-        // SAFETY: idx < cell_count, within the cursor row.
-        unsafe {
-            *cells.add(idx) = Cell::from_bits(template_bits | ((cps[idx] as u64) << CP_SHIFT));
-        }
+    for (cell, &cp) in dst.iter_mut().zip(cps) {
+        *cell = Cell::from_bits(template_bits | ((cp as u64) << CP_SHIFT));
     }
 }
 
@@ -1398,6 +1406,30 @@ impl Terminal {
         // so the grapheme break check against it is exact.
         let run_len: usize = 'run: {
             let mut idx: usize = 1;
+
+            // Vectorized scan for the narrow class: codepoints in
+            // [0x10, 0xFF] are always eligible with no further checks
+            // and dominate real-world input, so scan for the first
+            // codepoint outside that range several lanes at a time
+            // (Zig: `simd.lanes(u32)`, twice the native vector length).
+            // Anything else (including eligible unicode) proceeds via
+            // the scalar loop below.
+            if !WIDE {
+                const LANES: usize = 8;
+                while idx + LANES <= cps.len() {
+                    let v: &[u32; LANES] = cps[idx..idx + LANES].try_into().unwrap();
+                    // An AND reduction over the lanes, which LLVM turns
+                    // into vector compares; the first failing lane is
+                    // only located once, when the scan stops.
+                    let all_in_range = v.iter().fold(true, |acc, &cp| acc & print_slice_narrow_byte(cp));
+                    if !all_in_range {
+                        idx += v.iter().position(|&cp| !print_slice_narrow_byte(cp)).unwrap();
+                        break;
+                    }
+                    idx += LANES;
+                }
+            }
+
             while idx < cps.len() {
                 let cp = cps[idx];
                 if !WIDE && (0x10..=0xFF).contains(&cp) {
