@@ -36,7 +36,59 @@ pub struct DecodeResult {
 /// `output` must be at least as long as `input`.
 #[inline]
 pub fn utf8_decode_until_control_seq(input: &[u8], output: &mut [u32]) -> DecodeResult {
+    utf8_decode_until_control_seq_impl::<false>(input, output)
+}
+
+/// [`utf8_decode_until_control_seq`] compiled for AVX2, with a 32-byte
+/// ASCII fast path (Highway's AVX2 target in Zig's `vt.cpp`).
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub unsafe fn utf8_decode_until_control_seq_avx2(input: &[u8], output: &mut [u32]) -> DecodeResult {
+    utf8_decode_until_control_seq_impl::<true>(input, output)
+}
+
+/// The printable-run scan of the VT stream compiled for AVX2: starting at
+/// `end`, skip codepoints that are not C0 or (decoded) C1 controls, 16 at
+/// a time. Returns the index of the first control and true, or the index
+/// where fewer than 16 codepoints remain and false.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+pub unsafe fn printable_run_scan_avx2(cps: &[u32], mut end: usize) -> (usize, bool) {
+    use std::arch::x86_64::*;
+    // A control has no bit set outside 0x9F.
+    let mask = _mm256_set1_epi32(!0x9F);
+    let zero = _mm256_setzero_si256();
+    while end + 16 <= cps.len() {
+        // SAFETY: end + 16 <= cps.len().
+        let p = cps.as_ptr().add(end) as *const __m256i;
+        let a = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_loadu_si256(p), mask), zero);
+        let b = _mm256_cmpeq_epi32(_mm256_and_si256(_mm256_loadu_si256(p.add(1)), mask), zero);
+        let bits = (_mm256_movemask_ps(_mm256_castsi256_ps(a)) as u32)
+            | ((_mm256_movemask_ps(_mm256_castsi256_ps(b)) as u32) << 8);
+        if bits != 0 {
+            return (end + bits.trailing_zeros() as usize, true);
+        }
+        end += 16;
+    }
+    (end, false)
+}
+
+/// AVX selects the 32-byte AVX2 ASCII chunk; it must only be true in code
+/// compiled for AVX2.
+#[inline(always)]
+fn utf8_decode_until_control_seq_impl<const AVX: bool>(input: &[u8], output: &mut [u32]) -> DecodeResult {
     debug_assert!(output.len() >= input.len());
+    let chunk_len = if AVX { 2 * CHUNK } else { CHUNK };
 
     // ASCII fast path: terminal input is overwhelmingly ASCII, for which
     // UTF-8 decoding is a simple widening of each byte to 32 bits. We
@@ -45,17 +97,28 @@ pub fn utf8_decode_until_control_seq(input: &[u8], output: &mut [u32]) -> Decode
     // byte. This avoids a second pass over the input.
     let count = input.len();
     let mut i = 0;
-    while i + CHUNK <= count {
-        let chunk: &[u8; CHUNK] = input[i..i + CHUNK].try_into().unwrap();
-        let out: &mut [u32; CHUNK] = (&mut output[i..i + CHUNK]).try_into().unwrap();
-
+    while i + chunk_len <= count {
         // Widen the whole chunk unconditionally: output is guaranteed to
         // be at least as large as input, and if we stop mid-chunk only
         // the prefix is reported (the rest is scratch that the caller
         // never reads).
-        let stop_mask = widen_ascii_chunk(chunk, out);
+        let stop_mask = if AVX {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let chunk: &[u8; 2 * CHUNK] = input[i..i + 2 * CHUNK].try_into().unwrap();
+                let out: &mut [u32; 2 * CHUNK] = (&mut output[i..i + 2 * CHUNK]).try_into().unwrap();
+                // SAFETY: AVX is only true in code compiled for AVX2.
+                unsafe { widen_ascii_chunk_avx2(chunk, out) }
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            unreachable!()
+        } else {
+            let chunk: &[u8; CHUNK] = input[i..i + CHUNK].try_into().unwrap();
+            let out: &mut [u32; CHUNK] = (&mut output[i..i + CHUNK]).try_into().unwrap();
+            widen_ascii_chunk(chunk, out)
+        };
         if stop_mask == 0 {
-            i += CHUNK;
+            i += chunk_len;
             continue;
         }
 
@@ -96,6 +159,30 @@ pub fn utf8_decode_until_control_seq(input: &[u8], output: &mut [u32]) -> Decode
 }
 
 const CHUNK: usize = 16;
+
+/// [`widen_ascii_chunk`] for 32 bytes with AVX2.
+///
+/// # Safety
+///
+/// The CPU must support AVX2.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn widen_ascii_chunk_avx2(chunk: &[u8; 2 * CHUNK], out: &mut [u32; 2 * CHUNK]) -> u32 {
+    use std::arch::x86_64::*;
+    // SAFETY: all loads and stores are unaligned and in bounds of the
+    // 32-byte input and the 32-element output.
+    let v = _mm256_loadu_si256(chunk.as_ptr() as *const __m256i);
+    let esc = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(0x1B));
+    let mask = (_mm256_movemask_epi8(v) | _mm256_movemask_epi8(esc)) as u32;
+    let src = chunk.as_ptr();
+    let dst = out.as_mut_ptr() as *mut __m256i;
+    for k in 0..4 {
+        let b = _mm_loadl_epi64(src.add(8 * k) as *const __m128i);
+        _mm256_storeu_si256(dst.add(k), _mm256_cvtepu8_epi32(b));
+    }
+    mask
+}
 
 /// Widen 16 ASCII bytes into `out` and return a bitmask (bit k for byte k)
 /// of the bytes that stop the ASCII fast path: ESC or any byte >= 0x80.
@@ -560,6 +647,60 @@ mod tests {
                 "input={:x?}",
                 &input[..len]
             );
+
+            // The AVX2 instance (32-byte ASCII chunks) where available.
+            #[cfg(target_arch = "x86_64")]
+            if avx2::available() {
+                // SAFETY: AVX2 is available.
+                let res_avx = unsafe { utf8_decode_until_control_seq_avx2(&input[..len], &mut out_simd) };
+                assert_eq!(res_scalar, res_avx, "input={:x?}", &input[..len]);
+                assert_eq!(
+                    &out_scalar[..res_scalar.decoded],
+                    &out_simd[..res_avx.decoded],
+                    "input={:x?}",
+                    &input[..len]
+                );
+            }
+        }
+    }
+
+    // The AVX2 printable-run scan against the scalar scan it replaces.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn printable_run_scan_avx2_matches_scalar() {
+        if !avx2::available() {
+            return;
+        }
+        let mut rand = Rng(0xabad_1dea);
+        let special = [0u32, 0x1B, 0x1F, 0x0A, 0x80, 0x9F, 0x20, 0xA0, 0x7F, 0x109F, 0x1_009F, 0x8000_0000];
+        for _ in 0..20_000 {
+            let len = rand.range(1, 70) as usize;
+            let rate = rand.range(1, 40);
+            let cps: Vec<u32> = (0..len)
+                .map(|_| {
+                    if rand.range(0, rate) == 0 {
+                        special[rand.range(0, special.len() as u64 - 1) as usize]
+                    } else {
+                        rand.range(0x20, 0x10FFFF) as u32
+                    }
+                })
+                .collect();
+            let start = rand.range(0, len as u64 - 1) as usize;
+            let mut scalar = start;
+            while scalar < cps.len() && cps[scalar] & !0x9F != 0 {
+                scalar += 1;
+            }
+            // SAFETY: AVX2 is available.
+            let (mut end, found) = unsafe { printable_run_scan_avx2(&cps, start) };
+            if found {
+                assert_eq!(end, scalar, "{cps:x?} from {start}");
+            } else {
+                assert!(end <= scalar && end + 16 > cps.len());
+                while end < cps.len() && cps[end] & !0x9F != 0 {
+                    end += 1;
+                }
+                assert_eq!(end, scalar, "{cps:x?} from {start}");
+            }
         }
     }
 
