@@ -325,6 +325,26 @@ where
     /// Experimentally, this load factor works quite well.
     pub const LOAD_FACTOR: f64 = 0.8125;
 
+    /// LOAD_FACTOR as an exact fraction.
+    const LOAD_FACTOR_NUM: usize = 13;
+    const LOAD_FACTOR_DEN: usize = 16;
+    const LOAD_FACTOR_IS_FRACTION: () =
+        assert!(Self::LOAD_FACTOR_NUM as f64 / Self::LOAD_FACTOR_DEN as f64 == Self::LOAD_FACTOR);
+
+    /// `@intFromFloat(load_factor * @floatFromInt(table_cap))` for a
+    /// power-of-two table capacity, in integer arithmetic. The float
+    /// product is exact (LOAD_FACTOR is 13/16 and table_cap is far below
+    /// 2^53), so truncating it equals the floor division. The int-to-float
+    /// conversion was the critical path of page layout computations (Zig's
+    /// LLVM builds the power of two's float from its exponent instead).
+    #[inline(always)]
+    fn items_cap(table_cap: usize) -> usize {
+        #[allow(clippy::let_unit_value)]
+        let () = Self::LOAD_FACTOR_IS_FRACTION;
+        debug_assert!(table_cap.is_power_of_two() && table_cap <= 1 << 52);
+        table_cap * Self::LOAD_FACTOR_NUM / Self::LOAD_FACTOR_DEN
+    }
+
     /// Returns the minimum capacity needed to store `n` items,
     /// accounting for the load factor and the reserved ID 0.
     pub fn capacity_for_count(n: usize) -> usize {
@@ -368,7 +388,7 @@ where
         }
 
         let table_cap: usize = cap.next_power_of_two();
-        let items_cap: usize = (Self::LOAD_FACTOR * table_cap as f64) as usize;
+        let items_cap: usize = Self::items_cap(table_cap);
 
         let table_mask: Id = Id::from_usize((1usize << table_cap.ilog2()) - 1);
 
@@ -1087,6 +1107,22 @@ mod tests {
         // SAFETY: buf is total_size bytes aligned to BASE_ALIGN.
         let set = unsafe { TestSet::init(OffsetBuf::init(buf.ptr()), layout, Ctx) };
         (buf, set)
+    }
+
+    // The integer item capacity against Zig's float formula.
+    #[test]
+    fn items_cap_matches_load_factor_float() {
+        for k in 0..40 {
+            let table_cap = 1usize << k;
+            assert_eq!(
+                TestSet::items_cap(table_cap),
+                (TestSet::LOAD_FACTOR * table_cap as f64) as usize
+            );
+        }
+        for cap in 1..=65536usize {
+            let table_cap = cap.next_power_of_two();
+            assert_eq!(TestSet::layout(cap).cap, (TestSet::LOAD_FACTOR * table_cap as f64) as usize);
+        }
     }
 
     #[test]
