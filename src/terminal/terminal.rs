@@ -4780,8 +4780,14 @@ impl Terminal {
         // Pixel geometry and synchronized output are updated on every valid
         // resize attempt, including one that doesn't change the grid dimensions.
         // Save their old values so later allocation failures can roll them back.
-        let old_width_px = self.width_px;
-        let old_height_px = self.height_px;
+        //
+        // The two fields are read with separate 4-byte loads, as Zig's code
+        // does: rustc otherwise merges them into one 8-byte load to spill
+        // them together, which cannot be store-forwarded from the two
+        // 4-byte stores of the previous resize and stalls every call.
+        // SAFETY: plain reads of initialized fields.
+        let old_width_px = unsafe { std::ptr::read_volatile(&self.width_px) };
+        let old_height_px = unsafe { std::ptr::read_volatile(&self.height_px) };
         let old_synchronized_output = self.modes.get(Mode::SynchronizedOutput);
 
         let r = self.resize_(opts);
