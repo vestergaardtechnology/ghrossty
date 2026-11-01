@@ -599,6 +599,139 @@ const fn print_slice_cells_per_cp(wide: bool) -> usize {
     }
 }
 
+/// The vector length of the printSlice narrow run scan for the compile
+/// target (Zig: `simd.lanes(u32)`); 0 means a scalar loop.
+const PRINT_SLICE_LANES: usize = match crate::simd::lanes::<u32>() {
+    Some(l) => l,
+    None => 0,
+};
+
+/// The index of the first cell in `cells[start..]` whose SimpleMask bits
+/// differ from `expected`, or `cells.len()` if there is none. This is an
+/// early-exit search loop, and reused rows typically match the whole way
+/// through, so it scans several cells at a time (SimpleMask groups, or
+/// the explicit AVX2 loop in the AVX2 instance).
+#[inline(always)]
+fn simple_run_end<const AVX2: bool>(cells: &[Cell], start: usize, expected: u64) -> usize {
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    if AVX2 {
+        // SAFETY: only reached in the AVX2 instance of printSliceFill.
+        return unsafe { print_avx2::masked_eq_run_end(cells, start, SIMPLE_MASK_BITS, expected) };
+    }
+    simple_run_end_portable(cells, start, expected)
+}
+
+/// The portable [`simple_run_end`] (Zig: the `eqlPrefix` group loop plus
+/// the `eqlScalar` tail).
+#[inline(always)]
+fn simple_run_end_portable(cells: &[Cell], start: usize, expected: u64) -> usize {
+    let n = cells.len();
+    let group_len = SimpleMask::GROUP_LEN;
+    let mut i = start;
+    while i + group_len <= n {
+        let p = SimpleMask::eql_prefix(cells, i, expected);
+        i += p;
+        if p != group_len {
+            return i;
+        }
+    }
+    while i < n {
+        if !SimpleMask::eql_scalar(cells[i], expected) {
+            break;
+        }
+        i += 1;
+    }
+    i
+}
+
+/// Explicit AVX2 versions of the printSlice scan loops, used by the
+/// instance of printSliceFill compiled for AVX2 (see
+/// `Terminal::print_slice_fill`). Zig's portable `@Vector` loops get
+/// these widths from its native (AVX-512) build; the baseline Rust build
+/// selects them at runtime. Each returns exactly what the portable loop
+/// returns (checked by the differential tests).
+#[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+mod print_avx2 {
+    use super::Cell;
+    use std::arch::x86_64::*;
+
+    /// The narrow run scan: starting at `idx`, skip codepoints in
+    /// [0x10, 0xFF] 16 at a time and return the index of the first one
+    /// outside that range, or the index where fewer than 16 remain.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn narrow_run_scan(cps: &[u32], mut idx: usize) -> usize {
+        let lo = _mm256_set1_epi32(0x10);
+        let span = _mm256_set1_epi32(0xFF - 0x10);
+        while idx + 16 <= cps.len() {
+            // SAFETY: idx + 16 <= cps.len().
+            let p = cps.as_ptr().add(idx) as *const __m256i;
+            let a = _mm256_sub_epi32(_mm256_loadu_si256(p), lo);
+            let b = _mm256_sub_epi32(_mm256_loadu_si256(p.add(1)), lo);
+            // cp - 0x10 <= 0xEF (unsigned) <=> min(cp - 0x10, 0xEF) == cp - 0x10
+            let ina = _mm256_cmpeq_epi32(_mm256_min_epu32(a, span), a);
+            let inb = _mm256_cmpeq_epi32(_mm256_min_epu32(b, span), b);
+            let bits = (_mm256_movemask_ps(_mm256_castsi256_ps(ina)) as u32)
+                | ((_mm256_movemask_ps(_mm256_castsi256_ps(inb)) as u32) << 8);
+            if bits != 0xFFFF {
+                return idx + (!bits).trailing_zeros() as usize;
+            }
+            idx += 16;
+        }
+        idx
+    }
+
+    /// The index of the first value in `cells[start..]` whose bits under
+    /// `mask` differ from `expected`, or `cells.len()`.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    pub unsafe fn masked_eq_run_end(cells: &[Cell], start: usize, mask: u64, expected: u64) -> usize {
+        let n = cells.len();
+        let base = cells.as_ptr() as *const u64;
+        let m = _mm256_set1_epi64x(mask as i64);
+        let e = _mm256_set1_epi64x(expected as i64);
+        let mut i = start;
+        while i + 8 <= n {
+            // SAFETY: i + 8 <= n; Cell is a u64.
+            let p = base.add(i) as *const __m256i;
+            let a = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_loadu_si256(p), m), e);
+            let b = _mm256_cmpeq_epi64(_mm256_and_si256(_mm256_loadu_si256(p.add(1)), m), e);
+            let bits = (_mm256_movemask_pd(_mm256_castsi256_pd(a)) as u32)
+                | ((_mm256_movemask_pd(_mm256_castsi256_pd(b)) as u32) << 4);
+            if bits != 0xFF {
+                return i + (!bits).trailing_zeros() as usize;
+            }
+            i += 8;
+        }
+        while i < n {
+            // SAFETY: i < n.
+            if *base.add(i) & mask != expected {
+                return i;
+            }
+            i += 1;
+        }
+        n
+    }
+}
+
+/// A bitmask with bit k set if `f(v[k])` (Zig: `@bitCast` of a bool
+/// vector), for locating the first matching lane with a ctz.
+#[inline(always)]
+pub(crate) fn lane_bits<const N: usize>(v: &[u32; N], f: impl Fn(u32) -> bool) -> u64 {
+    debug_assert!(N <= 64);
+    v.iter()
+        .enumerate()
+        .fold(0u64, |acc, (k, &x)| acc | ((f(x) as u64) << k))
+}
+
 /// Whether a codepoint is in [0x10, 0xFF]: always narrow and always
 /// eligible for the batched narrow print fast path.
 #[inline(always)]
@@ -1379,7 +1512,18 @@ impl Terminal {
         grapheme_cluster: bool,
         allow_unicode: bool,
     ) -> Result<usize, IncreaseCapacityError> {
-        let r = self.print_slice_fill_::<WIDE>(cps, grapheme_cluster, allow_unicode);
+        // The scan and store loops below are vectorized; on x86_64 CPUs
+        // with AVX2 (when the compile target lacks it) use an instance
+        // compiled for AVX2, as Zig's native build does at compile time.
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+        let r = if crate::simd::avx2_available() && !crate::simd::force_portable() {
+            // SAFETY: AVX2 is available.
+            unsafe { self.print_slice_fill_avx2::<WIDE>(cps, grapheme_cluster, allow_unicode) }
+        } else {
+            self.print_slice_fill_::<WIDE, false>(cps, grapheme_cluster, allow_unicode)
+        };
+        #[cfg(not(all(target_arch = "x86_64", not(target_feature = "avx2"))))]
+        let r = self.print_slice_fill_::<WIDE, false>(cps, grapheme_cluster, allow_unicode);
 
         // After doing any printing, wrapping, scrolling, etc. we want to
         // ensure that our screen remains in a consistent state.
@@ -1387,7 +1531,27 @@ impl Terminal {
         r
     }
 
-    fn print_slice_fill_<const WIDE: bool>(
+    /// `print_slice_fill_` compiled for AVX2.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn print_slice_fill_avx2<const WIDE: bool>(
+        &mut self,
+        cps: &[u32],
+        grapheme_cluster: bool,
+        allow_unicode: bool,
+    ) -> Result<usize, IncreaseCapacityError> {
+        self.print_slice_fill_::<WIDE, true>(cps, grapheme_cluster, allow_unicode)
+    }
+
+    /// AVX2 selects the explicit AVX2 scan loops (only in the instance
+    /// compiled for AVX2, see `print_slice_fill`); otherwise the portable
+    /// vector loops are used, sized by `simd.lanes` for the compile target.
+    #[inline(always)]
+    fn print_slice_fill_<const WIDE: bool, const AVX2: bool>(
         &mut self,
         cps: &[u32],
         grapheme_cluster: bool,
@@ -1414,8 +1578,13 @@ impl Terminal {
             // (Zig: `simd.lanes(u32)`, twice the native vector length).
             // Anything else (including eligible unicode) proceeds via
             // the scalar loop below.
-            if !WIDE {
-                const LANES: usize = 8;
+            #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+            if !WIDE && AVX2 {
+                // SAFETY: only reached in the AVX2 instance.
+                idx = unsafe { print_avx2::narrow_run_scan(cps, idx) };
+            }
+            const LANES: usize = PRINT_SLICE_LANES;
+            if !WIDE && !AVX2 && LANES > 0 {
                 while idx + LANES <= cps.len() {
                     let v: &[u32; LANES] = cps[idx..idx + LANES].try_into().unwrap();
                     // An AND reduction over the lanes, which LLVM turns
@@ -1423,7 +1592,8 @@ impl Terminal {
                     // only located once, when the scan stops.
                     let all_in_range = v.iter().fold(true, |acc, &cp| acc & print_slice_narrow_byte(cp));
                     if !all_in_range {
-                        idx += v.iter().position(|&cp| !print_slice_narrow_byte(cp)).unwrap();
+                        let bits = lane_bits(v, |cp| !print_slice_narrow_byte(cp));
+                        idx += bits.trailing_zeros() as usize;
                         break;
                     }
                     idx += LANES;
@@ -1455,7 +1625,6 @@ impl Terminal {
 
         // The number of cells each codepoint occupies.
         let cells_per_cp: usize = print_slice_cells_per_cp(WIDE);
-        let group_len = SimpleMask::GROUP_LEN;
 
         let mut printed: usize = 0;
         'outer: while printed < run_len {
@@ -1554,22 +1723,7 @@ impl Terminal {
                 // branch-free (and vectorizable). This is an early-exit
                 // search loop, and reused rows typically match the whole
                 // way through, so scan several cells at a time.
-                let mut simple = k;
-                'simple: {
-                    while simple + group_len <= cell_count {
-                        let p = SimpleMask::eql_prefix(view(), simple, check_expected);
-                        simple += p;
-                        if p != group_len {
-                            break 'simple;
-                        }
-                    }
-                    while simple < cell_count {
-                        if !SimpleMask::eql_scalar(*cl(cells.wrapping_add(simple)), check_expected) {
-                            break;
-                        }
-                        simple += 1;
-                    }
-                }
+                let simple = simple_run_end::<AVX2>(view(), k, check_expected);
 
                 if WIDE {
                     // We can only write whole (wide, spacer) pairs.
@@ -1618,22 +1772,7 @@ impl Terminal {
                         debug_assert!(old_style != style_id); // it failed the simple check
 
                         // Find the run of cells with identical masked bits.
-                        let mut m = k + 1;
-                        'scan: {
-                            while m + group_len <= cell_count {
-                                let p = SimpleMask::eql_prefix(view(), m, first);
-                                m += p;
-                                if p != group_len {
-                                    break 'scan;
-                                }
-                            }
-                            while m < cell_count {
-                                if !SimpleMask::eql_scalar(*cl(cells.wrapping_add(m)), first) {
-                                    break;
-                                }
-                                m += 1;
-                            }
-                        }
+                        let m = simple_run_end::<AVX2>(view(), k + 1, first);
 
                         // Fix up the style ref counts for the whole run at
                         // once. Each of the old cells held a reference to
@@ -5151,6 +5290,213 @@ fn get_sentinel_cstr(storage: &[u8]) -> Option<&CStr> {
 mod tests {
     use super::*;
     use crate::terminal::page_list;
+
+    // ----- AVX2 print fast path loops against the portable loops -----
+
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+    }
+
+    /// The portable narrow run scan (the LANES loop of printSliceFill).
+    fn narrow_run_scan_portable(cps: &[u32], mut idx: usize) -> usize {
+        const LANES: usize = PRINT_SLICE_LANES;
+        while LANES > 0 && idx + LANES <= cps.len() {
+            let v: &[u32; LANES] = cps[idx..idx + LANES].try_into().unwrap();
+            if !v.iter().fold(true, |acc, &cp| acc & print_slice_narrow_byte(cp)) {
+                return idx + lane_bits(v, |cp| !print_slice_narrow_byte(cp)).trailing_zeros() as usize;
+            }
+            idx += LANES;
+        }
+        idx
+    }
+
+    /// Where the full run scan (vector loop, then the narrow-byte scalar
+    /// loop) stops, given the vector loop's result.
+    fn narrow_run_end(cps: &[u32], mut idx: usize) -> usize {
+        while idx < cps.len() && print_slice_narrow_byte(cps[idx]) {
+            idx += 1;
+        }
+        idx
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    #[test]
+    fn print_avx2_narrow_run_scan_matches_portable() {
+        if !crate::simd::avx2_available() {
+            return;
+        }
+        let mut rng = XorShift(0x0123_4567_89AB_CDEF);
+        let special = [0u32, 0x0F, 0x10, 0x7F, 0xFF, 0x100, 0x1B, 0xFFFF_FFFF, 0x8000_0010, 0x10FFFF];
+        for _ in 0..20_000 {
+            let len = (rng.next() % 80) as usize + 1;
+            let rate = rng.next() % 40 + 1;
+            let cps: Vec<u32> = (0..len)
+                .map(|_| {
+                    if rng.next() % rate == 0 {
+                        special[(rng.next() % special.len() as u64) as usize]
+                    } else {
+                        0x10 + (rng.next() % 0xF0) as u32
+                    }
+                })
+                .collect();
+            let start = (rng.next() % len as u64) as usize;
+            // SAFETY: AVX2 is available.
+            let fast = unsafe { print_avx2::narrow_run_scan(&cps, start) };
+            let portable = narrow_run_scan_portable(&cps, start);
+            assert_eq!(narrow_run_end(&cps, fast), narrow_run_end(&cps, portable), "{cps:x?} from {start}");
+            assert!(fast >= start && fast <= cps.len());
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    #[test]
+    fn print_avx2_simple_run_end_matches_portable() {
+        if !crate::simd::avx2_available() {
+            return;
+        }
+        let mut rng = XorShift(0xFEDC_BA98_7654_3210);
+        for _ in 0..20_000 {
+            let len = (rng.next() % 40) as usize;
+            let style: style::Id = (rng.next() % 3) as style::Id;
+            let expected = print_slice_check_expected(style);
+            let rate = rng.next() % 30 + 1;
+            let cells: Vec<Cell> = (0..len)
+                .map(|_| {
+                    // Mostly cells that match except for unmasked fields,
+                    // with occasional differences in masked fields.
+                    let mut c = Cell::init((rng.next() % 0x110000) as u32);
+                    c.set_style_id(style);
+                    if rng.next() % 2 == 0 {
+                        c.set_protected(true);
+                    }
+                    if rng.next() % rate == 0 {
+                        match rng.next() % 4 {
+                            0 => c.set_style_id(style + 1),
+                            1 => c.set_wide(Wide::Wide),
+                            2 => c.set_hyperlink(true),
+                            _ => c = Cell::from_bits(rng.next()),
+                        }
+                    }
+                    c
+                })
+                .collect();
+            let start = (rng.next() % (len as u64 + 1)) as usize;
+            assert_eq!(
+                simple_run_end::<true>(&cells, start, expected),
+                simple_run_end_portable(&cells, start, expected)
+            );
+        }
+    }
+
+    /// Random VT input mixing ASCII runs, SGR, wide and combining
+    /// codepoints, controls, decoded C1 controls, invalid UTF-8, charset
+    /// changes, margins and insert mode.
+    fn random_vt(rng: &mut XorShift, len: usize) -> Vec<u8> {
+        let pieces: &[&[u8]] = &[
+            b"\x1b[31m",
+            b"\x1b[1;44m",
+            b"\x1b[0m",
+            b"\x1b[38;2;1;2;3m",
+            b"\r\n",
+            b"\n",
+            b"\r",
+            b"\t",
+            b"\x08",
+            "\u{4e2d}\u{6587}".as_bytes(),
+            "e\u{301}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            "\u{85}".as_bytes(),
+            b"\xff\xc3",
+            b"\x1b(0",
+            b"\x1b(B",
+            b"\x1b[4h",
+            b"\x1b[4l",
+            b"\x1b[2;10r",
+            b"\x1b[r",
+            b"\x1b[?2027h",
+            b"\x1b[?2027l",
+            b"\x1b[5;3H",
+            b"\x1b[2K",
+            b"\x1b[3@",
+        ];
+        let mut out = Vec::with_capacity(len + 64);
+        while out.len() < len {
+            if rng.next() % 4 == 0 {
+                out.extend_from_slice(pieces[(rng.next() % pieces.len() as u64) as usize]);
+            } else {
+                let n = (rng.next() % 200) as usize;
+                for _ in 0..n {
+                    out.push(0x20 + (rng.next() % 0x5F) as u8);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every row and cell of the screen (including scrollback), as raw bits,
+    /// plus the cursor.
+    fn screen_bits(t: &Terminal) -> (Vec<u64>, (CellCountInt, CellCountInt, bool)) {
+        let s = &t.screens.active;
+        let mut bits = Vec::new();
+        let mut y = 0u32;
+        while let Some(c) = s.pages.get_cell(scr(0, y)) {
+            // SAFETY: valid row pointer.
+            bits.push(unsafe { (*c.row).to_bits() } & !(1 << 40)); // ignore dirty
+            for x in 0..t.cols {
+                let c = s.pages.get_cell(scr(x, y)).unwrap();
+                // SAFETY: valid cell pointer.
+                bits.push(unsafe { (*c.cell).to_bits() });
+            }
+            y += 1;
+        }
+        (bits, (s.cursor.x, s.cursor.y, s.cursor.pending_wrap))
+    }
+
+    // The AVX2 instances of the stream decode/scan and printSliceFill
+    // against the portable instances, end to end.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    #[test]
+    fn print_avx2_stream_matches_portable() {
+        if !crate::simd::avx2_available() {
+            return;
+        }
+        let mut rng = XorShift(0x5555_AAAA_1234_5678);
+        for round in 0..12 {
+            let cols = 5 + (rng.next() % 100) as CellCountInt;
+            let rows = 2 + (rng.next() % 30) as CellCountInt;
+            let len = 1000 + (rng.next() % 8000) as usize;
+            let input = random_vt(&mut rng, len);
+
+            let mut results = Vec::new();
+            for portable in [false, true] {
+                crate::simd::set_force_portable(portable);
+                let mut t = init(cols, rows);
+                {
+                    let mut s = t.vt_stream();
+                    // Feed in random slices to vary chunk boundaries.
+                    let mut i = 0;
+                    let mut r = XorShift(round + 1);
+                    while i < input.len() {
+                        let n = (1 + r.next() % 3000) as usize;
+                        let end = (i + n).min(input.len());
+                        s.next_slice(&input[i..end]);
+                        i = end;
+                    }
+                    s.deinit();
+                }
+                results.push((screen_bits(&t), t.plain_string().unwrap()));
+            }
+            crate::simd::set_force_portable(false);
+            assert!(results[0] == results[1], "round {round}");
+        }
+    }
 
     // ----- test helpers (Rust-only) -----
 
