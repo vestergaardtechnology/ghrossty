@@ -46,14 +46,13 @@ pub struct GraphemeWidth {
 /// line feeds, and carriage returns are expected to be filtered out before
 /// calling this function. This is because this function is tuned for
 /// Ghostty.
-#[inline]
+#[inline(always)]
 pub fn grapheme_break(cp1: u32, cp2: u32, state: &mut BreakState) -> bool {
-    let value = precompute::DATA[precompute::Key {
+    let value = precompute::lookup(precompute::Key {
         gb1: TABLE.get(cp1).grapheme_break,
         gb2: TABLE.get(cp2).grapheme_break,
         state: *state,
-    }
-    .index()];
+    });
     *state = value.state();
     value.result()
 }
@@ -201,8 +200,29 @@ mod precompute {
 
         #[inline(always)]
         pub fn state(self) -> BreakState {
-            BreakState::from_table_index(((self.0 >> 1) & 0b111) as usize)
+            let i = ((self.0 >> 1) & 0b111) as usize;
+            // Every value in DATA comes from `Value::new` (the table index
+            // of a valid BreakState, whose base is at most 2) or is zero,
+            // so from_table_index's invalid-base panic is unreachable.
+            if (i >> 1) & 0b11 == 3 {
+                // SAFETY: see above.
+                unsafe { std::hint::unreachable_unchecked() }
+            }
+            BreakState::from_table_index(i)
         }
+    }
+
+    /// `DATA[key.index()]` without a bounds check: a key packs into 13
+    /// bits (a 3-bit state and two 5-bit break properties, as Zig's
+    /// `packed struct(u13)`), so it always indexes DATA.
+    #[inline(always)]
+    pub(super) fn lookup(key: Key) -> Value {
+        const _: () = assert!(GraphemeBreakNoControl::ALL.len() <= 1 << 5);
+        const _: () = assert!(BreakState::TABLE_LEN <= 1 << 3);
+        let i = key.index();
+        debug_assert!(i < DATA.len());
+        // SAFETY: i < 2^13 == DATA.len() (asserted above).
+        unsafe { *DATA.get_unchecked(i) }
     }
 
     pub(super) static DATA: [Value; 1 << 13] = {

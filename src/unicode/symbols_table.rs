@@ -7,7 +7,7 @@
 //! `tools/gen_unicode_tables.py` into the committed `symbols_table_data.rs`;
 //! `symbols_uucode.rs` has a test checking that its generator reproduces it.
 
-use super::lut::Tables;
+use super::lut::{CheckedTables, Tables};
 
 mod generated {
     #![allow(clippy::all)]
@@ -15,8 +15,8 @@ mod generated {
 }
 
 /// The lookup tables for Ghostty.
-pub static TABLE: Tables<'static, bool> = Tables {
+pub static TABLE: CheckedTables<bool> = CheckedTables::new(Tables {
     stage1: &generated::STAGE1,
     stage2: &generated::STAGE2,
     stage3: &generated::STAGE3,
-};
+});

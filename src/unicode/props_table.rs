@@ -7,7 +7,7 @@
 //! `tools/gen_unicode_tables.py` into the committed `props_table_data.rs`;
 //! `props_uucode.rs` has a test checking that its generator reproduces it.
 
-use super::lut::Tables;
+use super::lut::{CheckedTables, Tables};
 use super::props::Properties;
 
 mod generated {
@@ -18,8 +18,8 @@ mod generated {
 }
 
 /// The lookup tables for Ghostty.
-pub static TABLE: Tables<'static, Properties> = Tables {
+pub static TABLE: CheckedTables<Properties> = CheckedTables::new(Tables {
     stage1: &generated::STAGE1,
     stage2: &generated::STAGE2,
     stage3: &generated::STAGE3,
-};
+});
