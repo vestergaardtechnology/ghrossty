@@ -63,6 +63,43 @@ pub const fn lanes<T>() -> Option<usize> {
     }
 }
 
+/// Whether the CPU supports AVX2, for hot loops that have a second,
+/// AVX2-compiled instance selected at runtime when the compile target
+/// itself lacks AVX2 (Zig's native default build gets the wider vectors
+/// at compile time; Highway and simdutf select them at runtime). The
+/// result is cached by `std`, so this is a load and a bit test.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub fn avx2_available() -> bool {
+    std::arch::is_x86_feature_detected!("avx2")
+}
+
+#[cfg(test)]
+thread_local! {
+    static FORCE_PORTABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test hook: while true (on this thread), the runtime-selected AVX2
+/// instances of the terminal print path are not used, so tests can
+/// compare them with the portable instances on the same machine.
+#[cfg(test)]
+pub fn set_force_portable(v: bool) {
+    FORCE_PORTABLE.with(|f| f.set(v));
+}
+
+/// See [`set_force_portable`]; always false outside tests.
+#[inline(always)]
+pub fn force_portable() -> bool {
+    #[cfg(test)]
+    {
+        FORCE_PORTABLE.with(|f| f.get())
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

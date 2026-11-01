@@ -178,6 +178,76 @@ impl<Elem: Copy> Tables<'_, Elem> {
     }
 }
 
+impl<Elem> Tables<'_, Elem> {
+    /// Whether every stage2 index that `get` can form from stage1 and every
+    /// stage3 index in stage2 is in bounds. Usable in const context.
+    pub const fn indices_in_bounds(&self) -> bool {
+        let mut i = 0;
+        while i < self.stage1.len() {
+            if self.stage1[i] as usize + 0xFF >= self.stage2.len() {
+                return false;
+            }
+            i += 1;
+        }
+        let mut j = 0;
+        while j < self.stage2.len() {
+            if self.stage2[j] as usize >= self.stage3.len() {
+                return false;
+            }
+            j += 1;
+        }
+        true
+    }
+}
+
+/// Static lookup tables whose stage2 and stage3 indices were checked when
+/// the table was built (at compile time for statics), so lookups only
+/// bounds-check stage1 (the codepoint range). Zig's ReleaseFast lookups
+/// carry no checks at all. Derefs to the plain [`Tables`].
+#[derive(Debug)]
+pub struct CheckedTables<Elem: 'static>(Tables<'static, Elem>);
+
+impl<Elem> Clone for CheckedTables<Elem> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<Elem> Copy for CheckedTables<Elem> {}
+
+impl<Elem: Copy> CheckedTables<Elem> {
+    /// Panics (at compile time in a static initializer) unless
+    /// [`Tables::indices_in_bounds`] holds.
+    pub const fn new(tables: Tables<'static, Elem>) -> Self {
+        assert!(tables.indices_in_bounds(), "lookup table index out of bounds");
+        CheckedTables(tables)
+    }
+
+    /// Given a codepoint, returns the mapping for that codepoint. The
+    /// codepoint must fit in a `u21` (`<= 0x1FFFFF`). Same result as
+    /// [`Tables::get`].
+    #[inline(always)]
+    pub fn get(&self, cp: u32) -> Elem {
+        let high = (cp >> 8) as usize;
+        let low = (cp & 0xFF) as usize;
+        let i2 = self.0.stage1[high] as usize + low;
+        // SAFETY: `new` checked that stage1 entries plus any low byte index
+        // stage2 in bounds and that stage2 entries index stage3 in bounds.
+        unsafe {
+            let i3 = *self.0.stage2.get_unchecked(i2) as usize;
+            *self.0.stage3.get_unchecked(i3)
+        }
+    }
+}
+
+impl<Elem> std::ops::Deref for CheckedTables<Elem> {
+    type Target = Tables<'static, Elem>;
+
+    fn deref(&self) -> &Tables<'static, Elem> {
+        &self.0
+    }
+}
+
 impl<Elem: fmt::Display> Tables<'_, Elem> {
     /// Writes the lookup table as Rust to the given writer. The written
     /// file exports three statics: STAGE1, STAGE2, and STAGE3, of which the

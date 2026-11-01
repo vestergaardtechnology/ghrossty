@@ -50,6 +50,13 @@ use log_unsupported_once;
 /// do something else.
 const DEBUG: bool = false;
 
+/// The vector length of the printable-run scan for the compile target
+/// (Zig: `simd.lanes(u32)`); 0 means a scalar loop.
+const STREAM_SCAN_LANES: usize = match crate::simd::lanes::<u32>() {
+    Some(l) => l,
+    None => 0,
+};
+
 macro_rules! define_actions {
     ($( $(#[$m:meta])* $variant:ident $(($ty:ty))? = $name:literal, )*) => {
         /// The possible actions that can be emitted by the Stream
@@ -957,11 +964,40 @@ impl<H: Handler> Stream<H> {
             cp_buf = vec![0; CP_BUF_LEN];
         }
 
-        // Split the input into chunks that fit into cp_buf.
+        // The UTF-8 decode and printable-run scan below are vectorized;
+        // on x86_64 CPUs with AVX2 (when the compile target lacks it) use
+        // an instance compiled for AVX2, as Zig's native build does at
+        // compile time (and Highway does at runtime for its decoder).
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+        if crate::simd::avx2_available() && !crate::simd::force_portable() {
+            // SAFETY: AVX2 is available.
+            unsafe { self.next_slice_chunks_avx2::<UNTIL>(input, &mut cp_buf, u) };
+            self.cp_buf = cp_buf;
+            return;
+        }
+        self.next_slice_chunks::<UNTIL, false>(input, &mut cp_buf, u);
+        self.cp_buf = cp_buf;
+    }
+
+    /// `next_slice_chunks` compiled for AVX2.
+    ///
+    /// # Safety
+    ///
+    /// The CPU must support AVX2.
+    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+    #[target_feature(enable = "avx2")]
+    unsafe fn next_slice_chunks_avx2<const UNTIL: bool>(&mut self, input: &[u8], cp_buf: &mut [u32], u: &mut Until) {
+        self.next_slice_chunks::<UNTIL, true>(input, cp_buf, u);
+    }
+
+    /// Split the input into chunks that fit into cp_buf. AVX2 selects the
+    /// explicit AVX2 loops (only in the AVX2 instance).
+    #[inline(always)]
+    fn next_slice_chunks<const UNTIL: bool, const AVX2: bool>(&mut self, input: &[u8], cp_buf: &mut [u32], u: &mut Until) {
         let mut i = 0;
         loop {
             let len = CP_BUF_LEN.min(input.len() - i);
-            self.next_slice_capped::<UNTIL>(&input[i..i + len], &mut cp_buf, u);
+            self.next_slice_capped::<UNTIL, AVX2>(&input[i..i + len], cp_buf, u);
             if UNTIL && u.stop.is_some() {
                 break;
             }
@@ -970,12 +1006,10 @@ impl<H: Handler> Stream<H> {
                 break;
             }
         }
-
-        self.cp_buf = cp_buf;
     }
 
     #[inline(always)]
-    fn next_slice_capped<const UNTIL: bool>(
+    fn next_slice_capped<const UNTIL: bool, const AVX2: bool>(
         &mut self,
         input: &[u8],
         cp_buf: &mut [u32],
@@ -1022,7 +1056,17 @@ impl<H: Handler> Stream<H> {
         // input until we see an ESC (0x1B), since all other characters
         // up to that point are just UTF-8.
         while self.parser.state == ParserState::Ground && offset < input.len() {
-            let res = crate::simd::vt::utf8_decode_until_control_seq(&input[offset..], cp_buf);
+            let res = if AVX2 {
+                #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+                // SAFETY: only reached in the AVX2 instance.
+                unsafe {
+                    crate::simd::vt::utf8_decode_until_control_seq_avx2(&input[offset..], cp_buf)
+                }
+                #[cfg(not(all(target_arch = "x86_64", not(target_feature = "avx2"))))]
+                unreachable!()
+            } else {
+                crate::simd::vt::utf8_decode_until_control_seq(&input[offset..], cp_buf)
+            };
             let cps = &cp_buf[..res.decoded];
 
             // Hand runs of printable codepoints to the handler as
@@ -1058,19 +1102,31 @@ impl<H: Handler> Stream<H> {
                 // and printable runs dominate real input, so scan
                 // several codepoints at a time manually.
                 let mut end = i + 1;
-                {
-                    const LANES: usize = 16;
-                    while end + LANES <= cps.len() {
-                        // Non-printable (C0 or decoded C1) is
-                        // equivalent to "no bit outside 0x9F is
-                        // set": one AND-test per lane.
-                        let stop = cps[end..end + LANES]
-                            .iter()
-                            .fold(false, |acc, &v| acc | (v & !0x9F == 0));
-                        if stop {
-                            break;
+                'scan: {
+                    #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
+                    if AVX2 {
+                        // SAFETY: only reached in the AVX2 instance.
+                        let (e, found) = unsafe { crate::simd::vt::printable_run_scan_avx2(cps, end) };
+                        end = e;
+                        if found {
+                            break 'scan;
                         }
-                        end += LANES;
+                    }
+                    const LANES: usize = STREAM_SCAN_LANES;
+                    if !AVX2 && LANES > 0 {
+                        while end + LANES <= cps.len() {
+                            // Non-printable (C0 or decoded C1) is
+                            // equivalent to "no bit outside 0x9F is
+                            // set": one AND-test per lane.
+                            let v: &[u32; LANES] = cps[end..end + LANES].try_into().unwrap();
+                            let stop = v.iter().fold(false, |acc, &v| acc | (v & !0x9F == 0));
+                            if stop {
+                                let bits = crate::terminal::terminal::lane_bits(v, |v| v & !0x9F == 0);
+                                end += bits.trailing_zeros() as usize;
+                                break 'scan;
+                            }
+                            end += LANES;
+                        }
                     }
                     while end < cps.len() && cps[end] & !0x9F != 0 {
                         end += 1;

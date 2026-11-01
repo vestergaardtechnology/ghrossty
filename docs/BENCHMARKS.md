@@ -13,7 +13,7 @@ hyperfine and prints the tables.
 | CPU | Intel Xeon Processor @ 2.10 GHz, 4 vCPU (KVM guest), AVX2 + AVX-512F/BW, 8 MiB L2, 260 MiB L3 |
 | Memory / OS | 15 GB, Linux 6.18.44 (x86_64), glibc |
 | Zig side | Ghostty `93967b7f9478e94dcbb42125c8a90f34feb40d75`, Zig 0.17.0 |
-| Rust side | ghostty-rs `ef30aaa` (after the optimizations below; the [before](#before-optimization) numbers are from `30a4945`), rustc 1.97.0 (2d8144b78 2026-07-07) |
+| Rust side | ghostty-rs `5a81a32` (after both rounds of optimizations below; the [before](#before-optimization) numbers are from `30a4945`), rustc 1.97.0 (2d8144b78 2026-07-07) |
 | Timer | hyperfine 2.0.0 (`-N`, no shell) |
 
 The VM is noisy even when otherwise idle: most results have a 5–10 %
@@ -27,7 +27,7 @@ columns of the two tables), so compare ratios within one table.
 |---|---|---|
 | Command | `zig build -Doptimize=ReleaseFast -Demit-bench -Dapp-runtime=none` | `cargo build --release --no-default-features --bin ghostty-bench --bin ghostty-gen` |
 | Target CPU | **native** (Zig's default: AVX-512 here) | **x86-64 baseline** (rustc's default) |
-| SIMD | `-Dsimd=true` (default): C++ Highway and simdutf, which pick AVX2 at runtime | pure Rust `std::arch`/`memchr`: SSE2 (baseline) code, plus AVX2 base64 and UTF-8 decoding and SSE4.2 CRC32C selected at runtime |
+| SIMD | `-Dsimd=true` (default): C++ Highway and simdutf, which pick AVX2 at runtime | pure Rust `std::arch`/`memchr`: SSE2 (baseline) code, plus AVX2 base64 and UTF-8 decoding, AVX2 instances of the VT stream loop and `printSliceFill`, and SSE4.2 CRC32C, selected at runtime |
 | Codegen | single LLVM module, no safety checks | default release profile: opt-level 3, 16 codegen units, thin-local LTO, overflow checks off, bounds checks on |
 
 On Linux the default `-Dapp-runtime=gtk` pulls the GTK app runtime into the
@@ -64,7 +64,8 @@ noise (`stream/ascii` -4 %, `stream/utf8` -3 %, `terminal-resize --mode=cols`
     snapshot cases.
 * hyperfine runs every case with the same `ghostty-bench +<bench> <flags>`
   on each binary: 2 warmups and 8 runs. The short or noisy cases were re-run
-  with 3 warmups and 20 runs and merged in, and the startup case uses 80 runs.
+  with 3 warmups and 20 runs, replacing the first pass, and the startup case
+  uses 80 (re-run: 200) runs.
   The number reported is the **median wall-clock time of the whole
   process**, as Ghostty's own `src/benchmark/AGENTS.md` prescribes. It
   includes reading the data file and any setup. The `noop` modes show that
@@ -91,75 +92,77 @@ maximum resident set size.
 
 | benchmark | Zig ms (median ± sd) | Rust ms | Rust/Zig | Rust native ms | Rust native/Zig | Zig baseline ms | Zig baseline/Zig | Rust/Zig baseline | Zig / Rust peak RSS MiB |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| stream/ascii | 68.7 ± 3.9 | 95.7 ± 11.3 | 1.39× | 82.9 ± 5.5 | 1.21× | 97.6 ± 10.4 | 1.42× | 0.98× | 6 / 7 |
-| stream/ascii-lines | 136.7 ± 13.1 | 148.7 ± 16.7 | 1.09× | 150.7 ± 9.4 | 1.10× | 151.4 ± 12.7 | 1.11× | 0.98× | 6 / 7 |
-| stream/seq | 1,119.7 ± 86.5 | 1,465.0 ± 62.9 | 1.31× | 1,360.1 ± 43.6 | 1.21× | 1,189.6 ± 51.4 | 1.06× | 1.23× | 5 / 7 |
-| stream/utf8 | 1,434.5 ± 83.0 | 1,435.4 ± 38.8 | 1.00× | 1,391.6 ± 52.4 | 0.97× | 1,336.5 ± 46.2 | 0.93× | 1.07× | 6 / 7 |
-| stream/styled | 132.3 ± 9.2 | 167.6 ± 7.2 | 1.27× | 166.9 ± 12.6 | 1.26× | 160.3 ± 10.2 | 1.21× | 1.05× | 6 / 7 |
-| stream/osc | 1,023.4 ± 12.3 | 790.7 ± 70.9 | 0.77× | 850.5 ± 28.4 | 0.83× | 1,226.0 ± 76.8 | 1.20× | 0.64× | 7 / 8 |
-| stream/kitty | 79.0 ± 8.1 | 40.7 ± 4.4 | 0.51× | 38.5 ± 6.2 | 0.49× | 77.5 ± 15.7 | 0.98× | 0.52× | 5 / 6 |
-| parser/ascii | 1,286.5 ± 48.3 | 799.5 ± 36.3 | 0.62× | 849.0 ± 479.0 | 0.66× | 1,056.9 ± 55.6 | 0.82× | 0.76× | 4 / 6 |
-| parser/utf8 | 971.8 ± 38.9 | 897.5 ± 58.4 | 0.92× | 813.1 ± 89.3 | 0.84× | 1,011.7 ± 65.7 | 1.04× | 0.89× | 4 / 6 |
-| parser/styled | 1,338.6 ± 102.4 | 781.8 ± 21.2 | 0.58× | 752.8 ± 30.8 | 0.56× | 1,056.1 ± 163.4 | 0.79× | 0.74× | 4 / 6 |
-| osc-parser | 60.8 ± 3.1 | 55.3 ± 10.1 | 0.91× | 63.1 ± 7.3 | 1.04× | 60.1 ± 8.0 | 0.99× | 0.92× | 4 / 6 |
-| apc-parser/kitty | 23.1 ± 2.5 | 27.1 ± 1.9 | 1.17× | 25.8 ± 1.5 | 1.11× | 24.8 ± 3.4 | 1.07× | 1.09× | 5 / 6 |
-| cp-width/noop | 1.6 ± 0.7 | 2.4 ± 1.4 | 1.46× | 2.3 ± 0.3 | 1.38× | 1.5 ± 0.3 | 0.94× | 1.56× | 4 / 6 |
-| cp-width/wcwidth | 460.3 ± 21.1 | 465.5 ± 24.1 | 1.01× | 468.3 ± 27.5 | 1.02× | 474.0 ± 18.0 | 1.03× | 0.98× | 4 / 6 |
-| cp-width/simd | 749.9 ± 30.2 | 406.4 ± 20.4 | 0.54× | 386.2 ± 18.4 | 0.52× | 778.0 ± 25.9 | 1.04× | 0.52× | 4 / 6 |
-| cp-width/table | 417.0 ± 12.4 | 378.8 ± 21.2 | 0.91× | 389.5 ± 21.2 | 0.93× | 414.0 ± 19.7 | 0.99× | 0.92× | 4 / 6 |
-| grapheme/noop | 356.3 ± 21.3 | 377.8 ± 21.9 | 1.06× | 380.8 ± 15.7 | 1.07× | 371.3 ± 19.7 | 1.04× | 1.02× | 4 / 6 |
-| grapheme/table | 411.6 ± 26.6 | 461.1 ± 20.0 | 1.12× | 467.6 ± 22.5 | 1.14× | 386.1 ± 18.1 | 0.94× | 1.19× | 4 / 6 |
-| is-symbol/uucode | 514.3 ± 90.0 | 492.3 ± 65.4 | 0.96× | 512.7 ± 52.1 | 1.00× | 457.1 ± 30.2 | 0.89× | 1.08× | 4 / 6 |
-| is-symbol/table | 388.2 ± 18.3 | 377.7 ± 11.7 | 0.97× | 407.0 ± 21.2 | 1.05× | 398.8 ± 20.5 | 1.03× | 0.95× | 4 / 6 |
-| screen-clone/noop | 41.1 ± 2.0 | 28.8 ± 2.1 | 0.70× | 34.1 ± 3.6 | 0.83× | 46.8 ± 7.7 | 1.14× | 0.61× | 6 / 7 |
-| screen-clone/clone | 170.0 ± 7.9 | 165.8 ± 10.4 | 0.98× | 166.2 ± 19.8 | 0.98× | 169.9 ± 9.7 | 1.00× | 0.98× | 97 / 98 |
-| screen-clone/render | 379.7 ± 26.0 | 348.8 ± 16.9 | 0.92× | 367.7 ± 32.4 | 0.97× | 391.3 ± 22.7 | 1.03× | 0.89× | 6 / 7 |
-| screen-clone/render-clean | 280.5 ± 25.4 | 161.3 ± 20.0 | 0.58× | 180.4 ± 12.0 | 0.64× | 260.6 ± 16.5 | 0.93× | 0.62× | 6 / 7 |
-| screen-clone/render-partial | 346.0 ± 19.8 | 259.0 ± 11.6 | 0.75× | 261.1 ± 12.6 | 0.75× | 309.1 ± 18.4 | 0.89× | 0.84× | 6 / 7 |
-| screen-clone/render-scroll | 900.0 ± 30.0 | 1,042.6 ± 44.0 | 1.16× | 1,054.1 ± 43.1 | 1.17× | 886.5 ± 39.6 | 0.98× | 1.18× | 73 / 73 |
-| screen-clone/render-output | 381.1 ± 11.8 | 404.5 ± 23.4 | 1.06× | 408.7 ± 27.0 | 1.07× | 385.9 ± 21.4 | 1.01× | 1.05× | 6 / 7 |
-| hyperlink-map/lookup | 597.5 ± 14.3 | 373.7 ± 22.5 | 0.63× | 358.9 ± 13.8 | 0.60× | 331.2 ± 18.4 | 0.55× | 1.13× | 4 / 6 |
-| hyperlink-map/churn | 366.4 ± 21.0 | 318.6 ± 29.5 | 0.87× | 391.5 ± 29.9 | 1.07× | 310.9 ± 25.2 | 0.85× | 1.02× | 4 / 6 |
-| page-compression/compress | 905.1 ± 62.1 | 873.3 ± 35.7 | 0.96× | 880.4 ± 24.9 | 0.97× | 937.0 ± 39.0 | 1.04× | 0.93× | 69 / 70 |
-| page-compression/store | 934.0 ± 41.4 | 882.0 ± 56.6 | 0.94× | 874.2 ± 67.7 | 0.94× | 979.2 ± 68.0 | 1.05× | 0.90× | 69 / 70 |
-| page-compression/decompress | 454.9 ± 24.3 | 439.6 ± 34.4 | 0.97× | 428.6 ± 9.3 | 0.94× | 455.2 ± 72.3 | 1.00× | 0.97× | 134 / 135 |
-| scrollback-compression/noop | 497.8 ± 43.8 | 483.3 ± 114.8 | 0.97× | 443.4 ± 21.1 | 0.89× | 524.6 ± 79.8 | 1.05× | 0.92× | 196 / 197 |
-| scrollback-compression/compress | 647.9 ± 46.0 | 645.8 ± 15.1 | 1.00× | 670.9 ± 67.5 | 1.04× | 716.8 ± 52.1 | 1.11× | 0.90× | 196 / 197 |
-| scrollback-compression/incremental | 651.9 ± 50.2 | 653.4 ± 15.6 | 1.00× | 650.3 ± 41.0 | 1.00× | 654.7 ± 47.1 | 1.00× | 1.00× | 196 / 197 |
-| scrollback-compression/restore | 802.5 ± 25.1 | 770.4 ± 18.1 | 0.96× | 778.1 ± 41.1 | 0.97× | 864.3 ± 132.2 | 1.08× | 0.89× | 230 / 231 |
-| formatter/noop | 8.9 ± 1.4 | 10.6 ± 0.9 | 1.19× | 10.8 ± 11.0 | 1.21× | 9.8 ± 1.0 | 1.09× | 1.09× | 11 / 12 |
-| formatter/plain | 933.6 ± 104.7 | 822.8 ± 26.9 | 0.88× | 752.3 ± 28.2 | 0.81× | 783.9 ± 32.1 | 0.84× | 1.05× | 12 / 13 |
-| formatter/vt | 470.4 ± 27.3 | 553.8 ± 27.4 | 1.18× | 701.9 ± 25.5 | 1.49× | 484.2 ± 23.6 | 1.03× | 1.14× | 12 / 13 |
-| formatter/html | 1,091.4 ± 46.6 | 1,070.3 ± 63.1 | 0.98× | 1,156.9 ± 103.3 | 1.06× | 1,064.5 ± 37.6 | 0.98× | 1.01× | 12 / 13 |
-| formatter/terminal-roundtrip | 24.9 ± 4.8 | 28.0 ± 5.2 | 1.13× | 27.9 ± 3.4 | 1.12× | 25.4 ± 6.6 | 1.02× | 1.10× | 20 / 20 |
-| resize/noop | 336.9 ± 30.6 | 368.2 ± 16.9 | 1.09× | 359.2 ± 26.9 | 1.07× | 334.8 ± 16.1 | 0.99× | 1.10× | 22 / 23 |
-| resize/cols | 178.2 ± 19.4 | 198.0 ± 9.7 | 1.11× | 183.5 ± 16.3 | 1.03× | 193.2 ± 11.3 | 1.08× | 1.02× | 24 / 25 |
-| resize/cols-no-reflow | 1,432.5 ± 58.5 | 1,357.8 ± 45.3 | 0.95× | 1,342.3 ± 33.5 | 0.94× | 1,370.8 ± 45.8 | 0.96× | 0.99× | 22 / 23 |
-| resize/rows | 1,330.3 ± 42.8 | 1,516.8 ± 56.0 | 1.14× | 1,317.5 ± 24.4 | 0.99× | 1,374.0 ± 58.2 | 1.03× | 1.10× | 22 / 23 |
-| resize/both | 194.3 ± 15.2 | 194.2 ± 15.0 | 1.00× | 170.7 ± 14.3 | 0.88× | 191.3 ± 12.3 | 0.98× | 1.02× | 24 / 24 |
-| snapshot/noop | 12.2 ± 1.0 | 14.5 ± 3.4 | 1.19× | 14.1 ± 5.7 | 1.15× | 13.9 ± 2.7 | 1.14× | 1.04× | 14 / 15 |
-| snapshot/encode | 373.9 ± 14.1 | 388.5 ± 41.5 | 1.04× | 297.9 ± 16.7 | 0.80× | 579.9 ± 32.7 | 1.55× | 0.67× | 14 / 15 |
-| snapshot/decode | 396.8 ± 17.2 | 420.6 ± 20.3 | 1.06× | 367.8 ± 20.8 | 0.93× | 425.0 ± 16.8 | 1.07× | 0.99× | 21 / 23 |
-| snapshot/decode-ready | 149.2 ± 14.3 | 171.4 ± 13.5 | 1.15× | 132.6 ± 15.8 | 0.89× | 141.5 ± 8.1 | 0.95× | 1.21× | 14 / 15 |
-| startup/bench-no-data | 1.7 ± 0.5 | 2.4 ± 0.6 | 1.38× | 2.3 ± 0.1 | 1.33× | 1.6 ± 0.3 | 0.93× | 1.49× | 4 / 6 |
-| snapshot/encode-kitty | 288.1 ± 50.9 | 253.6 ± 11.8 | 0.88× | 251.3 ± 12.4 | 0.87× | 438.9 ± 30.8 | 1.52× | 0.58× | 23 / 25 |
+| stream/ascii | 78.5 ± 8.4 | 82.9 ± 4.4 | 1.06× | 105.9 ± 6.3 | 1.35× | 102.5 ± 7.3 | 1.31× | 0.81× | 5 / 6 |
+| stream/ascii-lines | 140.0 ± 11.5 | 155.1 ± 6.4 | 1.11× | 183.3 ± 10.8 | 1.31× | 159.5 ± 12.2 | 1.14× | 0.97× | 5 / 6 |
+| stream/seq | 1,224.9 ± 33.3 | 1,391.8 ± 40.7 | 1.14× | 1,438.3 ± 59.3 | 1.17× | 1,232.7 ± 73.4 | 1.01× | 1.13× | 5 / 7 |
+| stream/utf8 | 1,350.4 ± 52.4 | 1,466.4 ± 50.4 | 1.09× | 1,402.3 ± 42.8 | 1.04× | 1,449.5 ± 41.5 | 1.07× | 1.01× | 6 / 7 |
+| stream/styled | 151.0 ± 8.7 | 173.6 ± 12.9 | 1.15× | 187.1 ± 9.1 | 1.24× | 182.5 ± 14.1 | 1.21× | 0.95× | 5 / 6 |
+| stream/osc | 1,096.5 ± 59.0 | 846.5 ± 31.7 | 0.77× | 794.4 ± 48.9 | 0.72× | 1,243.7 ± 44.8 | 1.13× | 0.68× | 7 / 8 |
+| stream/kitty | 83.7 ± 11.7 | 44.2 ± 6.5 | 0.53× | 40.5 ± 9.3 | 0.48× | 85.0 ± 13.4 | 1.02× | 0.52× | 5 / 6 |
+| parser/ascii | 1,365.8 ± 40.0 | 846.3 ± 30.2 | 0.62× | 853.5 ± 24.6 | 0.62× | 1,185.4 ± 260.6 | 0.87× | 0.71× | 4 / 6 |
+| parser/utf8 | 1,030.5 ± 258.2 | 881.0 ± 18.3 | 0.85× | 893.0 ± 25.6 | 0.87× | 969.1 ± 174.7 | 0.94× | 0.91× | 4 / 6 |
+| parser/styled | 1,370.4 ± 39.9 | 847.3 ± 139.6 | 0.62× | 858.4 ± 43.0 | 0.63× | 1,158.7 ± 31.8 | 0.85× | 0.73× | 4 / 6 |
+| osc-parser | 69.9 ± 5.7 | 63.3 ± 9.2 | 0.91× | 60.1 ± 2.6 | 0.86× | 69.1 ± 4.7 | 0.99× | 0.92× | 4 / 6 |
+| apc-parser/kitty | 25.8 ± 2.9 | 31.1 ± 3.2 | 1.21× | 30.0 ± 7.4 | 1.17× | 27.1 ± 3.4 | 1.05× | 1.15× | 4 / 6 |
+| cp-width/noop | 1.8 ± 0.2 | 2.6 ± 0.1 | 1.46× | 2.7 ± 0.1 | 1.49× | 1.7 ± 0.2 | 0.97× | 1.50× | 4 / 6 |
+| cp-width/wcwidth | 508.6 ± 19.2 | 473.0 ± 20.6 | 0.93× | 488.6 ± 14.9 | 0.96× | 505.3 ± 11.1 | 0.99× | 0.94× | 4 / 6 |
+| cp-width/simd | 807.3 ± 35.9 | 433.8 ± 17.3 | 0.54× | 441.5 ± 19.2 | 0.55× | 896.2 ± 104.8 | 1.11× | 0.48× | 4 / 6 |
+| cp-width/table | 450.9 ± 27.3 | 411.0 ± 21.9 | 0.91× | 444.3 ± 30.4 | 0.99× | 455.2 ± 19.9 | 1.01× | 0.90× | 4 / 6 |
+| grapheme/noop | 398.2 ± 20.3 | 413.9 ± 21.1 | 1.04× | 411.0 ± 16.9 | 1.03× | 377.1 ± 17.0 | 0.95× | 1.10× | 4 / 6 |
+| grapheme/table | 461.8 ± 28.4 | 463.9 ± 18.8 | 1.00× | 484.4 ± 15.9 | 1.05× | 452.0 ± 21.4 | 0.98× | 1.03× | 4 / 6 |
+| is-symbol/uucode | 455.6 ± 20.0 | 410.7 ± 21.6 | 0.90× | 469.0 ± 20.1 | 1.03× | 439.5 ± 21.8 | 0.96× | 0.93× | 4 / 6 |
+| is-symbol/table | 464.9 ± 15.4 | 435.4 ± 18.6 | 0.94× | 427.8 ± 16.5 | 0.92× | 436.4 ± 25.2 | 0.94× | 1.00× | 4 / 6 |
+| screen-clone/noop | 51.4 ± 3.4 | 32.9 ± 4.1 | 0.64× | 37.5 ± 4.3 | 0.73× | 50.0 ± 3.7 | 0.97× | 0.66× | 6 / 6 |
+| screen-clone/clone | 170.6 ± 12.4 | 162.5 ± 9.1 | 0.95× | 170.3 ± 10.8 | 1.00× | 176.8 ± 12.9 | 1.04× | 0.92× | 97 / 97 |
+| screen-clone/render | 403.8 ± 23.4 | 376.0 ± 15.2 | 0.93× | 383.3 ± 18.2 | 0.95× | 385.1 ± 14.9 | 0.95× | 0.98× | 6 / 7 |
+| screen-clone/render-clean | 298.5 ± 17.0 | 166.9 ± 10.0 | 0.56× | 187.9 ± 15.1 | 0.63× | 278.7 ± 18.0 | 0.93× | 0.60× | 6 / 7 |
+| screen-clone/render-partial | 363.6 ± 20.0 | 285.7 ± 18.8 | 0.79× | 280.9 ± 25.9 | 0.77× | 370.8 ± 20.3 | 1.02× | 0.77× | 6 / 7 |
+| screen-clone/render-scroll | 979.9 ± 27.2 | 960.2 ± 56.7 | 0.98× | 959.2 ± 22.2 | 0.98× | 993.9 ± 55.0 | 1.01× | 0.97× | 72 / 73 |
+| screen-clone/render-output | 416.6 ± 17.3 | 453.8 ± 30.1 | 1.09× | 411.8 ± 10.7 | 0.99× | 411.7 ± 26.1 | 0.99× | 1.10× | 6 / 7 |
+| hyperlink-map/lookup | 657.0 ± 43.5 | 382.8 ± 16.4 | 0.58× | 670.2 ± 140.4 | 1.02× | 365.3 ± 19.4 | 0.56× | 1.05× | 4 / 6 |
+| hyperlink-map/churn | 407.7 ± 7.7 | 317.9 ± 20.5 | 0.78× | 415.3 ± 17.2 | 1.02× | 322.8 ± 24.5 | 0.79× | 0.98× | 4 / 6 |
+| page-compression/compress | 980.7 ± 35.5 | 1,030.1 ± 137.5 | 1.05× | 1,009.9 ± 20.3 | 1.03× | 1,043.6 ± 64.4 | 1.06× | 0.99× | 69 / 70 |
+| page-compression/store | 1,003.2 ± 103.3 | 995.7 ± 38.4 | 0.99× | 981.4 ± 32.9 | 0.98× | 1,054.7 ± 43.6 | 1.05× | 0.94× | 69 / 70 |
+| page-compression/decompress | 599.5 ± 21.5 | 581.5 ± 53.3 | 0.97× | 647.7 ± 49.5 | 1.08× | 618.0 ± 33.4 | 1.03× | 0.94× | 134 / 135 |
+| scrollback-compression/noop | 469.2 ± 22.1 | 455.0 ± 11.3 | 0.97× | 507.5 ± 42.4 | 1.08× | 534.2 ± 43.2 | 1.14× | 0.85× | 196 / 197 |
+| scrollback-compression/compress | 710.4 ± 37.8 | 675.6 ± 20.9 | 0.95× | 744.9 ± 30.2 | 1.05× | 767.5 ± 35.6 | 1.08× | 0.88× | 196 / 197 |
+| scrollback-compression/incremental | 678.5 ± 34.8 | 678.1 ± 28.1 | 1.00× | 763.9 ± 28.9 | 1.13× | 745.1 ± 50.3 | 1.10× | 0.91× | 196 / 197 |
+| scrollback-compression/restore | 924.7 ± 38.1 | 905.1 ± 90.1 | 0.98× | 927.4 ± 49.2 | 1.00× | 917.7 ± 21.5 | 0.99× | 0.99× | 230 / 231 |
+| formatter/noop | 11.4 ± 2.5 | 11.1 ± 0.4 | 0.97× | 12.5 ± 4.7 | 1.09× | 10.5 ± 1.5 | 0.92× | 1.05× | 11 / 12 |
+| formatter/plain | 844.9 ± 45.3 | 901.4 ± 32.1 | 1.07× | 874.9 ± 43.9 | 1.04× | 867.1 ± 25.1 | 1.03× | 1.04× | 12 / 13 |
+| formatter/vt | 525.2 ± 20.0 | 561.5 ± 31.0 | 1.07× | 671.3 ± 29.7 | 1.28× | 569.2 ± 35.5 | 1.08× | 0.99× | 12 / 13 |
+| formatter/html | 1,238.7 ± 44.9 | 1,166.7 ± 45.0 | 0.94× | 1,219.8 ± 41.9 | 0.98× | 1,188.4 ± 50.4 | 0.96× | 0.98× | 12 / 13 |
+| formatter/terminal-roundtrip | 25.7 ± 4.4 | 30.7 ± 8.7 | 1.19× | 42.4 ± 22.1 | 1.65× | 28.0 ± 6.6 | 1.09× | 1.10× | 19 / 20 |
+| resize/noop | 373.7 ± 31.6 | 239.9 ± 14.8 | 0.64× | 245.9 ± 17.7 | 0.66× | 381.5 ± 13.6 | 1.02× | 0.63× | 22 / 23 |
+| resize/cols | 199.8 ± 111.2 | 227.8 ± 14.0 | 1.14× | 197.2 ± 14.7 | 0.99× | 215.8 ± 21.3 | 1.08× | 1.06× | 23 / 24 |
+| resize/cols-no-reflow | 1,487.6 ± 57.2 | 1,410.7 ± 53.9 | 0.95× | 1,411.6 ± 66.8 | 0.95× | 1,397.1 ± 63.1 | 0.94× | 1.01× | 22 / 23 |
+| resize/rows | 1,466.0 ± 35.5 | 1,430.9 ± 89.6 | 0.98× | 1,416.1 ± 67.0 | 0.97× | 1,479.7 ± 54.7 | 1.01× | 0.97× | 22 / 23 |
+| resize/both | 202.7 ± 18.0 | 220.4 ± 16.6 | 1.09× | 198.2 ± 10.3 | 0.98× | 221.5 ± 18.3 | 1.09× | 0.99× | 23 / 24 |
+| snapshot/noop | 12.6 ± 1.8 | 15.1 ± 2.4 | 1.19× | 16.0 ± 1.8 | 1.26× | 14.4 ± 2.4 | 1.14× | 1.05× | 14 / 15 |
+| snapshot/encode | 429.8 ± 29.4 | 412.4 ± 18.5 | 0.96× | 358.7 ± 22.1 | 0.83× | 641.4 ± 29.5 | 1.49× | 0.64× | 14 / 15 |
+| snapshot/decode | 432.1 ± 23.2 | 455.1 ± 29.3 | 1.05× | 412.8 ± 16.3 | 0.96× | 480.1 ± 26.2 | 1.11× | 0.95× | 21 / 22 |
+| snapshot/decode-ready | 163.8 ± 15.1 | 169.0 ± 8.9 | 1.03× | 164.7 ± 15.3 | 1.01× | 163.4 ± 11.6 | 1.00× | 1.03× | 14 / 15 |
+| startup/bench-no-data | 1.8 ± 0.8 | 2.7 ± 0.6 | 1.49× | 2.7 ± 1.0 | 1.49× | 1.8 ± 0.3 | 1.01× | 1.47× | 4 / 5 |
+| snapshot/encode-kitty | 316.3 ± 9.5 | 285.4 ± 18.3 | 0.90× | 279.6 ± 11.6 | 0.88× | 507.3 ± 23.7 | 1.60× | 0.56× | 23 / 25 |
 
 The exact flags for each case are in the `CASES` array of
 `tools/bench_compare.sh`.
 
 **Summary.** The summary covers the 44 non-`noop`, non-startup cases. The
-geometric mean of Rust/Zig is **0.94×** (1.19× before optimization). The
-geometric mean of Rust/Zig baseline (same ISA) is **0.93×** (1.15× before).
-Rust native/Zig is 0.93×. Rust is faster than Zig in 17 cases, within ±5 %
-in 13, and slower in 14. Peak memory is the same on both sides, within about
-1–2 MiB of fixed overhead.
+geometric mean of Rust/Zig is **0.92×** (0.94× after the first round of
+optimizations, 1.19× before any). The geometric mean of Rust/Zig baseline
+(same ISA) is **0.90×** (0.93×, 1.15×). Rust native/Zig is 0.96×. Rust is
+faster than Zig in 19 cases, within ±5 % in 11, and slower in 14. Most of
+those 14 are within this VM's run-to-run noise (see the analysis); the
+ones that are not are explained there. Peak memory is the same on both
+sides, within about 1–2 MiB of fixed overhead.
 
 ### Binary sizes
 
 | binary | Zig bytes | Rust bytes | Zig stripped | Rust stripped |
 |---|---:|---:|---:|---:|
-| ghostty-bench | 67,925,960 | 2,950,680 | 9,620,344 | 2,378,224 |
-| ghostty-gen | 6,475,896 | 921,776 | 570,424 | 636,744 |
+| ghostty-bench | 67,925,960 | 2,987,216 | 9,620,344 | 2,419,144 |
+| ghostty-gen | 6,475,896 | 923,016 | 570,424 | 637,896 |
 
 The Zig ReleaseFast bench tools ship with DWARF debug info, so the stripped
 sizes are the ones to compare. The Zig `ghostty-bench` also statically links
@@ -173,7 +176,8 @@ app runtime on Linux is GTK (see Builds). So `ghostty +version` could not be
 compared. Instead, `startup/bench-no-data` runs `ghostty-bench
 +terminal-parser` without `--data`. That measures process start, `global.init`
 and argument parsing, and the benchmark step returns immediately. Zig takes
-1.7 ms and Rust 2.4 ms. Both are close to the timer's resolution.
+1.8 ms and Rust 2.7 ms. Both are close to the timer's resolution; the
+difference is dynamic loading (see the analysis).
 
 ## Optimizations
 
@@ -204,45 +208,91 @@ after, from the two tables on this page.
 | **CRC32C at runtime** (`crc32c.rs`): the backend was chosen at compile time only, so the baseline build used software CRC while native Zig gets the SSE4.2 instruction. Baseline x86_64 builds now detect SSE4.2 at runtime. | snapshot/encode-kitty | 1.16× / 0.70× | 0.88× / 0.58× |
 | **AVX2 UTF-8 decoding** (`simd/vt.rs`): Zig hands non-ASCII stream text to simdutf's AVX2 UTF-8 → UTF-32 converter; the port decoded it one codepoint at a time. A runtime-detected AVX2 block decoder now validates and converts blocks of 16 sequence starts that are entirely well-formed; ill-formed or incomplete input keeps the scalar maximal-subpart decoder. | stream/utf8 | 1.18× / 1.23× | 1.00× / 1.07× |
 
+A second round (commits `3d101e0`..`5a81a32`) targeted the cases that
+were still above 1.05×. Its before/after ratios are focused hyperfine
+measurements (10–40 runs, both binaries in the same hyperfine call,
+listed in each commit message); the [Results](#results) table is the
+full run afterwards.
+
+| change | cases | before | after |
+|---|---|---:|---:|
+| **Unchecked table lookups** (`unicode/lut.rs`, `unicode/grapheme.rs`): the static property/symbol tables are `CheckedTables`, whose stage2/stage3 indices are validated when the static is built (at compile time), so a lookup bounds-checks only the codepoint range; the grapheme-break table index is a 13-bit packed key (Zig: `packed struct(u13)`) and needs no check; `grapheme_break` is inlined as in Zig. | grapheme/table | 1.18× / 1.18× | 1.01× / 1.02× |
+| **Style fill from registers** (`terminal/render.rs`): Zig's `fillStyles` writes each 28-byte `Style` as two overlapping 16-byte stores held in registers; the port's `slice::fill` reloaded the value from the stack for every cell. `fill_styles` now does what Zig does (with `MaybeUninit` chunks, so padding is copied soundly). | screen-clone/render-scroll | 1.22× / 1.18× | 1.00× / 0.97× |
+| **AVX2 print path** (`terminal/terminal.rs`, `terminal/stream.rs`, `simd/vt.rs`): Zig's native build compiles the print path's portable `@Vector` loops for AVX-512, and Highway picks AVX2 for its decoder at runtime. On x86_64 CPUs with AVX2 (when the compile target lacks it) the stream chunk loop and `printSliceFill` now run instances compiled for AVX2: 32-byte ASCII widening, a 16-lane printable-run scan, and explicit AVX2 narrow-run and simple-cell scans (the 4-cell `eqlPrefix` loop had stayed scalar). The run scans locate the stop lane with a ctz like Zig's `@ctz`. The instance dispatch is inlined into `printSlice`, so either instance is one call away; the AVX2 simple-cell scan tests the first cell before its vector loop. Differential tests compare each AVX2 loop with the portable one, and an end-to-end test feeds the same random VT input through both instances (a test-only switch forces the portable one) and compares every cell. | stream/ascii | 1.38× / 0.99× | 1.00× / 0.76× |
+| | stream/ascii-lines | 1.19× / 1.05× | 1.07× / 0.96× |
+| | stream/styled | 1.26× / 1.02× | 1.12× / 0.90× |
+| | stream/seq | 1.18× / 1.15× | 1.11× / 1.09× |
+| **Integer item capacity** (`terminal/ref_counted_set.rs`): `MetaLayout.init` dominates `terminal-resize --mode=rows` on both sides with identical instruction counts, but rustc emitted a `cvtsi2sd` (int → float, no dependency-breaking xor) on its critical path for `load_factor * floatFromInt(table_cap)`. The load factor is exactly 13/16 (checked at compile time) and `table_cap` is a power of two far below 2^53, so the float product is exact and equals `table_cap * 13 / 16`, which the layout now computes. | resize/rows | 1.14× / 1.10× | 0.98× / 0.95× |
+| **Codepoint-first blank test** (`terminal/formatter.rs`): rustc evaluated `cp == 0 and wide == .narrow and run_style_id == 0` branch-free for every cell; a `cold_path` hint in the `cp == 0` arm keeps text cells on one branch, as Zig's code does (439 M → 402 M Ir; Zig baseline 391 M). | formatter/vt | 1.15× / 1.14× | 1.03× / 1.02× |
+| | formatter/html | 1.03× / 1.05× | 0.99× / 1.00× |
+| **Store-forwarding stall in resize** (`terminal/terminal.rs`): `Terminal.resize` saves `width_px`/`height_px` for its error rollback, and rustc merged the two 4-byte reads into one 8-byte load, which cannot be forwarded from the previous call's two 4-byte stores and stalled every call. They are now two 4-byte (volatile) loads, as in Zig's code. | resize/noop | 1.09× / 1.10× | 0.66× / 0.67× |
+
 ## Analysis
 
 ### Where the Rust port is still slower
 
-* **`stream/ascii` and `stream/styled` against native Zig (1.27–1.39×).**
-  Like-for-like they are at parity (0.98× and 1.05× against Zig baseline).
-  The remaining gap is AVX-512 code generation in native Zig: Zig baseline
-  itself is 1.2–1.4× slower than native Zig here, while
-  `-C target-cpu=native` gains Rust only 0–13 %.
-* **`stream/seq` (1.31× / 1.23×).** `seq` output is one short line (about 8
-  bytes) per print call, so it measures the per-call cost of the print path
-  (`print_slice`, `print_slice_fill` setup, the LF handler and
-  `Stream::next_slice`). Leaving out the `memset` artefact, Rust executes
-  about 1.2× the instructions of Zig baseline here (984 M vs 830 M Ir on
-  8 MiB), spread over many small per-call differences rather than one hot
-  spot. This benchmark did not change with the optimizations above (the
-  pre-optimization binary measures 1.24× / 1.21× in this session); the
-  earlier table's 1.14× was a quieter run.
-* **`screen-clone/render-scroll` (1.16× / 1.18×), `resize/rows`
-  (1.14× / 1.10×) and `grapheme/table` (1.12× / 1.19×).** Unchanged by these
-  optimizations: side by side in this session the pre-optimization binary
-  measures 1.16×, 1.10× and 1.14× against Zig, the current one 1.14×, 1.07×
-  and 1.17×. The first two were within noise in the earlier run. Not
-  investigated further.
-* **`formatter/vt` (1.18× / 1.14×).** After specialization the per-cell loop
-  is structurally the same as Zig's `writeCellRun`, but it executes about
-  63 Ir per emitted cell against Zig's 53 (777 M vs 662 M on 20 loops),
-  mostly in packed-field extraction. The native Rust build is slower still
-  (1.49×): LLVM's AVX-512 code for this loop is worse than its SSE2 code.
-* **`apc-parser/kitty` (1.17× / 1.09×).** The base64 decoding now matches
-  simdutf; the remaining difference (about 4 ms of 27 ms) is per-command
-  allocation and zeroing of the decode buffer (Zig decodes in place, which
-  Rust slices cannot alias) and process overhead. Removing the zeroing in
-  an experiment did not change the wall time measurably.
-* **`snapshot/decode-ready` (1.15× / 1.21×).** A 150 ms case at the edge
-  of the noise: a separate 10-run measurement in the same session gave
-  1.04× / 1.06×. Its decode loop now matches Zig's fixed-width stores.
-* **Startup and `noop` modes (1.1–1.5×, 0.7–1 ms).** Process start and
-  reading the data file; at the timer's resolution.
+Run-to-run noise in this VM is about ±5–10 % per case, so a single row
+above 1.05× is not by itself a gap: `formatter/plain` (1.07×),
+`page-compression/compress` (1.05×), `snapshot/decode` (1.05×),
+`stream/utf8` (1.09×) and `screen-clone/render-output` (1.09×) are within
+1.10× of Zig baseline here, and focused runs of the same binaries measured
+them at 0.95–1.05× against native Zig (render-output: 0.99×). The cases
+with a known or suspected cause:
+
+* **`resize/cols` (1.14× / 1.06×) and `resize/both` (1.09× / 0.99×).**
+  At parity against the same ISA, and unchanged by this round (the
+  pre-round binary measures the same in a shared hyperfine run). The
+  remainder is native Zig's code generation; not investigated further.
+* **`stream/seq` (1.14× / 1.13×).** One ~8-byte line per print call, so it
+  measures the per-line cost of the stream loop, `printSlice`,
+  `printSliceFill` and the linefeed/scroll path. Rust executes about 1.13×
+  Zig baseline's instructions here (246 M vs 218 M on 2 MiB, leaving out the
+  `memset` counting artefact), spread over many small differences: about
+  40 instructions per call in `printSliceFill` (bounds checks on slices
+  and `previous_char`, the `pageAssumeResident` variant check, setup), 30
+  in the scroll path (one more call level, a `Limits` copy in `grow`) and
+  a few in the `vt` handler, which is one function over the action enum
+  where Zig instantiates one per action. Several targeted attempts
+  (inlining `linefeed`/`cursorDownScroll`, field-wise pin stores, a 4-cell
+  AVX2 scan tail, the wrapping range check in the scalar narrow loop)
+  reduced instruction counts by 1–4 % but did not move the wall time
+  beyond noise, or made it worse, and were reverted. Removing the
+  remaining checks would need `unreachable_unchecked`-style changes that
+  turn the port's checked invariants into undefined behaviour.
+* **`stream/styled` (1.15× / 0.95×) and `stream/ascii-lines` (1.11× /
+  0.97×).** At parity or better against the same ISA; the rest is native
+  Zig's AVX-512 code, including its own `memset` (`quirks_memset.zig`,
+  2 × 64-byte stores per iteration), which zeroes the recycled pages: 140
+  MB per 8 MiB of styled input. The port uses glibc's `rep stosb`; forcing
+  glibc's vector loop with `GLIBC_TUNABLES` was within noise here and
+  slower on `stream/seq`. `stream/ascii` is at 1.06×.
+* **Rust native is slower than Rust baseline on the print-heavy stream
+  cases** (e.g. `stream/ascii` 1.35× vs 1.06×). With `-C target-cpu=native`
+  the runtime AVX2 instances are compiled out (the compile target already
+  has AVX2) and the portable loops are used, which LLVM vectorizes less
+  well than the explicit AVX2 loops.
+* **`formatter/vt` (1.07× / 0.99×) is code-layout sensitive.** Two builds
+  whose `write_cell_run` is instruction-for-instruction identical (401.8 M
+  Ir on 10 loops; it moved by 544 bytes because of an unrelated change in
+  `resize`) measured 570 ms and 680 ms (1.07× and 1.28×) in the same
+  hyperfine run. Its instruction count is now 1.03× Zig baseline's.
+  Without stable function alignment control (or changing the build flags)
+  this cannot be pinned down.
+* **`apc-parser/kitty` (1.21× / 1.15×) and `formatter/terminal-roundtrip`
+  (1.19× / 1.10×)**, 26–31 ms runs. About 1 ms of each is process start:
+  the Rust `ghostty-bench` links 15 shared libraries (harfbuzz, fontconfig,
+  freetype, oniguruma, glib, …; `global_init` logs their versions as Zig's
+  does) that the Zig build links statically, and full RELRO binds every
+  symbol at start (`startup/bench-no-data`: 2.7 ms vs 1.8 ms; `do_lookup_x`
+  alone is 0.48 M Ir). The rest of `apc-parser` is the decode buffer: Zig
+  decodes base64 in place, while the port allocates and zeroes a separate
+  buffer (Rust slices cannot alias) — 34.3 M vs 25.6 M Ir on 8 MiB, of
+  which 6.4 M is the zeroing `memset`. In-place decoding would need the
+  AVX2 decoder's fallback (which restarts on the scalar path) to work on
+  clobbered input. Neither was changed: static linking or lazy binding is a
+  build configuration change.
+* **Startup and `noop` modes (1.0–1.5×, ~1 ms).** The same dynamic loading
+  cost.
 
 ### Where the Rust port is faster
 
@@ -256,13 +306,15 @@ after, from the two tables on this page.
 * **`codepoint-width --mode=simd`: about 0.55×.** Zig calls the C++
   function `ghostty_simd_codepoint_width` (from `vt.cpp`) once per codepoint,
   so it cannot be inlined. The port's pure-Rust `simd::codepoint_width` inlines.
-* **Render-state updates: `render-clean` 0.6×, `render-partial` 0.75×.** Also
-  `screen-clone/noop` (0.7×) and the full-stream OSC path (`stream/osc`,
-  0.64–0.77×).
+* **Render-state updates: `render-clean` 0.6×, `render-partial` 0.8×.** Also
+  `screen-clone/noop` (0.6–0.7×) and the full-stream OSC path (`stream/osc`,
+  0.68–0.77×).
+* **`resize/noop`: 0.64×.** Since the store-forwarding fix, the Rust resize
+  no-op path executes 64 instructions against Zig's 103.
 * **Snapshot encode at baseline ISA (0.58–0.67× against Zig baseline)**,
   because the Rust build now uses the CRC32C instruction at runtime while
   Zig baseline uses its software CRC.
-* **`hyperlink-map/lookup`: 0.63× against native Zig.** It is 1.13× against
+* **`hyperlink-map/lookup`: 0.58× against native Zig.** It is 1.05× against
   Zig baseline, so this is a Zig native code-generation effect, not a Rust
   advantage.
 

@@ -1954,10 +1954,16 @@ impl<'a> PageFormatter<'a> {
                 // Styled formats only treat unstyled empty cells as
                 // blank; anything else (including spaces) is written
                 // so that styling is preserved.
-                if cp == 0 && cell.wide() == Wide::Narrow && run_style_id == 0 {
-                    pending += 1;
-                    i += 1;
-                    continue;
+                if cp == 0 {
+                    // Keep text cells on a single branch. Without the
+                    // hint LLVM evaluates all three conditions branch-free
+                    // for every cell; Zig's codegen tests cp first.
+                    std::hint::cold_path();
+                    if cell.wide() == Wide::Narrow && run_style_id == 0 {
+                        pending += 1;
+                        i += 1;
+                        continue;
+                    }
                 }
             } else {
                 // Cells with no text are blank.
