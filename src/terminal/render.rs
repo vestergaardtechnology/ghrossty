@@ -2164,7 +2164,39 @@ impl RenderState {
 /// with a `Copy` value is already vectorized by LLVM in Rust.
 #[inline]
 fn fill_styles(dst: &mut [Style], value: Style) {
-    dst.fill(value);
+    use std::mem::MaybeUninit;
+
+    // Each element is written as two overlapping 16-byte vector
+    // stores held in registers, which requires 16 <= size <= 32.
+    // (A plain `fill` reloads the value from memory for every element.)
+    const ELEM_SIZE: usize = std::mem::size_of::<Style>();
+    const _: () = assert!(ELEM_SIZE >= 16 && ELEM_SIZE <= 32);
+
+    // The chunks are MaybeUninit so that padding bytes may be copied; a
+    // MaybeUninit of a 16-byte vector type stays in a vector register.
+    #[cfg(target_arch = "x86_64")]
+    type V = MaybeUninit<std::arch::x86_64::__m128i>;
+    #[cfg(not(target_arch = "x86_64"))]
+    type V = MaybeUninit<u128>;
+    let src = (&value as *const Style).cast::<u8>();
+    // SAFETY: both 16-byte reads are within `value` (16 <= ELEM_SIZE).
+    let (lo, hi) = unsafe {
+        (
+            std::ptr::read_unaligned(src.cast::<V>()),
+            std::ptr::read_unaligned(src.add(ELEM_SIZE - 16).cast::<V>()),
+        )
+    };
+
+    let base = dst.as_mut_ptr().cast::<u8>();
+    for i in 0..dst.len() {
+        // SAFETY: both stores are within element i of `dst`, and together
+        // they write all of its bytes, exactly as `value` holds them.
+        unsafe {
+            let p = base.add(i * ELEM_SIZE);
+            std::ptr::write_unaligned(p.cast::<V>(), lo);
+            std::ptr::write_unaligned(p.add(ELEM_SIZE - 16).cast::<V>(), hi);
+        }
+    }
 }
 
 /// Returns true if the two style run lists denormalize to
@@ -3313,6 +3345,51 @@ mod tests {
             ..TerminalOptions::new(cols, rows)
         })
         .unwrap()
+    }
+
+    // fill_styles (two overlapping vector stores per element) against
+    // slice::fill, for varied styles, lengths and sub-slices.
+    #[test]
+    fn fill_styles_matches_fill() {
+        use crate::terminal::color::Rgb;
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let color = |r: u64| -> style::Color {
+            match r % 3 {
+                0 => style::Color::None,
+                1 => style::Color::Palette((r >> 8) as u8),
+                _ => style::Color::Rgb(Rgb { r: (r >> 8) as u8, g: (r >> 16) as u8, b: (r >> 24) as u8 }),
+            }
+        };
+        for _ in 0..500 {
+            let mut value = Style {
+                fg_color: color(next()),
+                bg_color: color(next()),
+                underline_color: color(next()),
+                ..Style::default()
+            };
+            let f = next();
+            value.flags.bold = f & 1 != 0;
+            value.flags.inverse = f & 2 != 0;
+            value.flags.strikethrough = f & 4 != 0;
+            let old = Style { fg_color: color(next()), ..Style::default() };
+            let len = (next() % 40) as usize;
+            let start = (next() % (len as u64 + 1)) as usize;
+            let end = start + (next() % ((len - start) as u64 + 1)) as usize;
+
+            let mut a = vec![old; len];
+            let mut b = vec![old; len];
+            fill_styles(&mut a[start..end], value);
+            b[start..end].fill(value);
+            for (x, y) in a.iter().zip(&b) {
+                assert!(x.eql(y));
+            }
+        }
     }
 
     /// Feed `input` to a VT stream of `t` (Zig: `s.nextSlice(input)`).
