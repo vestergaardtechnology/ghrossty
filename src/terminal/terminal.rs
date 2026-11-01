@@ -1506,6 +1506,7 @@ impl Terminal {
     /// The row-filling portion of the printSlice fast path, specialized by
     /// width class. The first codepoint must already be validated by the
     /// caller (printSliceFast).
+    #[inline(always)]
     fn print_slice_fill<const WIDE: bool>(
         &mut self,
         cps: &[u32],
@@ -1515,20 +1516,25 @@ impl Terminal {
         // The scan and store loops below are vectorized; on x86_64 CPUs
         // with AVX2 (when the compile target lacks it) use an instance
         // compiled for AVX2, as Zig's native build does at compile time.
+        // This dispatch is inlined into the caller, so either instance is
+        // one call away like Zig's printSliceFill.
         #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
-        let r = if crate::simd::avx2_available() && !crate::simd::force_portable() {
+        if crate::simd::avx2_available() && !crate::simd::force_portable() {
             // SAFETY: AVX2 is available.
-            unsafe { self.print_slice_fill_avx2::<WIDE>(cps, grapheme_cluster, allow_unicode) }
-        } else {
-            self.print_slice_fill_::<WIDE, false>(cps, grapheme_cluster, allow_unicode)
-        };
-        #[cfg(not(all(target_arch = "x86_64", not(target_feature = "avx2"))))]
-        let r = self.print_slice_fill_::<WIDE, false>(cps, grapheme_cluster, allow_unicode);
+            return unsafe { self.print_slice_fill_avx2::<WIDE>(cps, grapheme_cluster, allow_unicode) };
+        }
+        self.print_slice_fill_portable::<WIDE>(cps, grapheme_cluster, allow_unicode)
+    }
 
-        // After doing any printing, wrapping, scrolling, etc. we want to
-        // ensure that our screen remains in a consistent state.
-        self.screens.active.assert_integrity();
-        r
+    /// `print_slice_fill_` for the compile target.
+    #[inline(never)]
+    fn print_slice_fill_portable<const WIDE: bool>(
+        &mut self,
+        cps: &[u32],
+        grapheme_cluster: bool,
+        allow_unicode: bool,
+    ) -> Result<usize, IncreaseCapacityError> {
+        self.print_slice_fill_::<WIDE, false>(cps, grapheme_cluster, allow_unicode)
     }
 
     /// `print_slice_fill_` compiled for AVX2.
@@ -1538,6 +1544,7 @@ impl Terminal {
     /// The CPU must support AVX2.
     #[cfg(all(target_arch = "x86_64", not(target_feature = "avx2")))]
     #[target_feature(enable = "avx2")]
+    #[inline(never)]
     unsafe fn print_slice_fill_avx2<const WIDE: bool>(
         &mut self,
         cps: &[u32],
@@ -1552,6 +1559,21 @@ impl Terminal {
     /// vector loops are used, sized by `simd.lanes` for the compile target.
     #[inline(always)]
     fn print_slice_fill_<const WIDE: bool, const AVX2: bool>(
+        &mut self,
+        cps: &[u32],
+        grapheme_cluster: bool,
+        allow_unicode: bool,
+    ) -> Result<usize, IncreaseCapacityError> {
+        let r = self.print_slice_fill_run::<WIDE, AVX2>(cps, grapheme_cluster, allow_unicode);
+
+        // After doing any printing, wrapping, scrolling, etc. we want to
+        // ensure that our screen remains in a consistent state.
+        self.screens.active.assert_integrity();
+        r
+    }
+
+    #[inline(always)]
+    fn print_slice_fill_run<const WIDE: bool, const AVX2: bool>(
         &mut self,
         cps: &[u32],
         grapheme_cluster: bool,
