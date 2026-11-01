@@ -699,6 +699,12 @@ mod print_avx2 {
         let m = _mm256_set1_epi64x(mask as i64);
         let e = _mm256_set1_epi64x(expected as i64);
         let mut i = start;
+        // Runs are often empty (e.g. overwriting cells that each need the
+        // general path), so test the first cell before the vector loop.
+        // SAFETY: i < n.
+        if i < n && *base.add(i) & mask != expected {
+            return i;
+        }
         while i + 8 <= n {
             // SAFETY: i + 8 <= n; Cell is a u64.
             let p = base.add(i) as *const __m256i;
